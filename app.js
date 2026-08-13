@@ -4,7 +4,9 @@ let state = {
   sourcePath: '',
   scannedFiles: 0,
   totalFiles: 0,
-  expandedRow: null
+  expandedRow: null,
+  ocrSelected: new Set(), // fullPaths of skipped, OCR-eligible PDFs currently checked
+  ocrRunning: false
 };
 
 const $ = (id) => document.getElementById(id);
@@ -100,6 +102,7 @@ $('scanBtn').addEventListener('click', async () => {
     state.sourcePath = data.sourcePath || path;
     state.scannedFiles = data.scannedFiles || 0;
     state.totalFiles = data.totalFiles || 0;
+    state.ocrSelected = new Set(state.skipped.filter(isOcrCandidate).map(s => s.fullPath));
 
     let msg = `Scanned ${data.scannedFiles} of ${data.totalFiles} file(s), ${state.results.length} match row(s).`;
     if (state.skipped.length) msg += ` ${state.skipped.length} file(s) skipped - see below.`;
@@ -171,6 +174,87 @@ function parseNdjsonLine(line) {
   }
 }
 
+// ---------- OCR rescan of skipped PDFs ----------
+
+function showOcrProgress(visible) {
+  $('ocrProgressPanel').style.display = visible ? 'block' : 'none';
+}
+
+function setOcrProgress(processed, total, currentFile) {
+  const pct = total > 0 ? Math.round((processed / total) * 100) : 0;
+  $('ocrProgressBarFill').style.width = pct + '%';
+  $('ocrProgressPercent').textContent = pct + '%';
+  $('ocrProgressLabel').textContent = total > 0
+    ? `${processed} of ${total} PDF(s) OCR'd${currentFile ? ' \u2014 ' + currentFile : ''}`
+    : 'Preparing OCR...';
+}
+
+$('ocrBtn').addEventListener('click', async () => {
+  const items = state.skipped.filter(s => state.ocrSelected.has(s.fullPath));
+  if (!items.length) return;
+
+  const keywords = parseKeywords($('keywords').value);
+  if (keywords.length === 0) { setStatus('Enter at least one keyword before running OCR.', true); return; }
+
+  state.ocrRunning = true;
+  updateOcrButton();
+  setOcrProgress(0, 0, '');
+  showOcrProgress(true);
+  setStatus(`Running OCR on ${items.length} PDF(s)...`);
+
+  try {
+    const res = await fetch('/api/ocr', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        items: items.map(s => ({ fullPath: s.fullPath, fileName: s.fileName, directory: s.directory, extension: s.extension })),
+        keywords,
+        caseSensitive: $('caseSensitive').checked,
+        wholeWord: $('wholeWord').checked,
+        useRegex: $('useRegex').checked
+      })
+    });
+
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || 'OCR failed');
+    }
+
+    const data = await readNdjsonScanResponse(res, (processed, total, currentFile) => {
+      setOcrProgress(processed, total, currentFile);
+    });
+
+    if (!data) throw new Error('OCR did not complete - no results received');
+
+    const recovered = new Set(data.recoveredPaths || []);
+    const newResults = Array.isArray(data.results) ? data.results : (data.results ? [data.results] : []);
+    const stillSkipped = Array.isArray(data.skippedFiles) ? data.skippedFiles : (data.skippedFiles ? [data.skippedFiles] : []);
+
+    // Drop the OCR'd files from the skipped list (recovered ones are gone
+    // entirely; still-unreadable ones are replaced with the updated
+    // ocrAttempted record from the server) and merge in any new matches.
+    const ocrdPaths = new Set(items.map(s => s.fullPath));
+    state.skipped = state.skipped.filter(s => !ocrdPaths.has(s.fullPath)).concat(stillSkipped);
+    state.results = state.results.concat(newResults);
+    state.scannedFiles = (state.scannedFiles || 0) + recovered.size;
+    items.forEach(s => state.ocrSelected.delete(s.fullPath));
+
+    let msg = `OCR complete: recovered ${recovered.size} of ${items.length} PDF(s), ${newResults.length} new match row(s).`;
+    if (stillSkipped.length) msg += ` ${stillSkipped.length} still unreadable after OCR.`;
+    setStatus(msg);
+
+    populateFilterOptions();
+    renderResults();
+    renderSkipped();
+  } catch (e) {
+    setStatus('OCR error: ' + e.message, true);
+  } finally {
+    state.ocrRunning = false;
+    updateOcrButton();
+    showOcrProgress(false);
+  }
+});
+
 // ---------- Filtering ----------
 
 function populateFilterOptions() {
@@ -223,7 +307,7 @@ function renderResults() {
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td class="keyword">${escapeHtml(r.keyword)}</td>
-      <td>${escapeHtml(r.fileName)}</td>
+      <td>${escapeHtml(r.fileName)}${r.viaOcr ? ' <span class="badge viaocr">via OCR</span>' : ''}</td>
       <td>${escapeHtml(r.extension)}</td>
       <td class="count">${r.count}</td>
       <td class="dir" title="${escapeHtml(r.fullPath)}">${escapeHtml(r.directory)}</td>
@@ -233,6 +317,13 @@ function renderResults() {
   });
 }
 
+// A skipped PDF is a candidate for OCR if the server flagged it as
+// ocrEligible (no extractable text layer - likely scanned/image-based) and
+// OCR hasn't already been attempted against it.
+function isOcrCandidate(s) {
+  return !!s.ocrEligible && !s.ocrAttempted;
+}
+
 function renderSkipped() {
   const panel = $('skippedPanel');
   const body = $('skippedBody');
@@ -240,22 +331,86 @@ function renderSkipped() {
 
   if (!state.skipped.length) {
     panel.style.display = 'none';
+    updateOcrButton();
     return;
   }
   panel.style.display = 'block';
-  $('skippedCount').textContent = `${state.skipped.length} file(s) skipped`;
+
+  const candidates = state.skipped.filter(isOcrCandidate);
+  const eligibleCount = state.skipped.filter(s => s.ocrEligible).length;
+  let msg = `${state.skipped.length} file(s) skipped`;
+  if (eligibleCount) msg += ` \u2014 ${eligibleCount} PDF(s) skipped due to no OCR (no extractable text layer)`;
+  $('skippedCount').textContent = msg;
 
   state.skipped.forEach(s => {
     const tr = document.createElement('tr');
+    const candidate = isOcrCandidate(s);
+    const checkboxCell = candidate
+      ? `<td class="checkcol"><input type="checkbox" class="ocrRowCheck" data-path="${escapeHtml(s.fullPath)}" ${state.ocrSelected.has(s.fullPath) ? 'checked' : ''}></td>`
+      : `<td class="checkcol"></td>`;
+    let badge = '';
+    if (s.viaOcr === false && s.ocrAttempted) {
+      badge = '<span class="badge attempted">OCR attempted</span>';
+    } else if (candidate) {
+      badge = '<span class="badge eligible">OCR eligible</span>';
+    } else if (s.ocrAttempted) {
+      badge = '<span class="badge attempted">OCR attempted</span>';
+    }
     tr.innerHTML = `
+      ${checkboxCell}
       <td title="${escapeHtml(s.fullPath)}">${escapeHtml(s.fileName)}</td>
       <td>${escapeHtml(s.extension)}</td>
       <td class="dir" title="${escapeHtml(s.fullPath)}">${escapeHtml(s.directory)}</td>
       <td class="reason">${escapeHtml(s.reason)}</td>
+      <td>${badge}</td>
     `;
     body.appendChild(tr);
   });
+
+  body.querySelectorAll('.ocrRowCheck').forEach(cb => {
+    cb.addEventListener('change', () => {
+      if (cb.checked) state.ocrSelected.add(cb.dataset.path);
+      else state.ocrSelected.delete(cb.dataset.path);
+      updateOcrButton();
+      syncOcrSelectAll();
+    });
+  });
+
+  syncOcrSelectAll();
+  updateOcrButton();
 }
+
+function syncOcrSelectAll() {
+  const candidates = state.skipped.filter(isOcrCandidate);
+  const selectAll = $('ocrSelectAll');
+  if (!candidates.length) {
+    selectAll.checked = false;
+    selectAll.indeterminate = false;
+    selectAll.disabled = true;
+    return;
+  }
+  selectAll.disabled = false;
+  const selectedCount = candidates.filter(s => state.ocrSelected.has(s.fullPath)).length;
+  selectAll.checked = selectedCount === candidates.length;
+  selectAll.indeterminate = selectedCount > 0 && selectedCount < candidates.length;
+}
+
+function updateOcrButton() {
+  const btn = $('ocrBtn');
+  const count = state.ocrSelected.size;
+  btn.textContent = count ? `Run OCR on ${count} selected PDF${count === 1 ? '' : 's'}` : 'Run OCR on selected PDFs';
+  btn.disabled = state.ocrRunning || count === 0;
+}
+
+$('ocrSelectAll').addEventListener('change', () => {
+  const candidates = state.skipped.filter(isOcrCandidate);
+  if ($('ocrSelectAll').checked) {
+    candidates.forEach(s => state.ocrSelected.add(s.fullPath));
+  } else {
+    candidates.forEach(s => state.ocrSelected.delete(s.fullPath));
+  }
+  renderSkipped();
+});
 
 function toggleDetail(tr, r, idx) {
   const existing = tr.nextElementSibling;
@@ -312,6 +467,7 @@ $('exportTxt').addEventListener('click', () => {
     lines.push(`File: ${r.fileName}`);
     lines.push(`Path: ${r.fullPath}`);
     lines.push(`Count: ${r.count}`);
+    if (r.viaOcr) lines.push('Via OCR: yes');
     lines.push('Snippets:');
     (r.snippets || []).forEach(s => lines.push(`  - ${s}`));
     lines.push('');
@@ -326,6 +482,8 @@ $('exportTxt').addEventListener('click', () => {
       lines.push(`File: ${s.fileName}`);
       lines.push(`Path: ${s.fullPath}`);
       lines.push(`Reason: ${s.reason}`);
+      if (s.ocrEligible) lines.push(`OCR eligible: ${!s.ocrAttempted ? 'yes' : 'no (already attempted)'}`);
+      if (s.ocrAttempted) lines.push('OCR attempted: yes');
       lines.push('');
     });
   }
@@ -348,6 +506,7 @@ $('importFile').addEventListener('change', async (e) => {
     state.sourcePath = parsed.sourcePath || '';
     state.scannedFiles = parsed.scannedFiles || 0;
     state.totalFiles = parsed.totalFiles || 0;
+    state.ocrSelected = new Set(state.skipped.filter(isOcrCandidate).map(s => s.fullPath));
     populateFilterOptions();
     renderResults();
     renderSkipped();
@@ -392,12 +551,15 @@ function parseTxtSkipped(text) {
     const fullPath = get('Path');
     const fileName = fullPath ? fullPath.split(/[\\/]/).pop() : get('File');
     const directory = fullPath ? fullPath.slice(0, fullPath.length - fileName.length - 1) : '';
+    const ocrEligibleRaw = get('OCR eligible').toLowerCase();
     return {
       fileName,
       directory,
       fullPath,
       extension: fileName.includes('.') ? fileName.slice(fileName.lastIndexOf('.')) : '',
-      reason: get('Reason')
+      reason: get('Reason'),
+      ocrEligible: ocrEligibleRaw.startsWith('yes'),
+      ocrAttempted: get('OCR attempted').toLowerCase() === 'yes'
     };
   });
 }
@@ -426,7 +588,8 @@ function parseTxtExport(text) {
       fullPath,
       extension: fileName.includes('.') ? fileName.slice(fileName.lastIndexOf('.')) : '',
       count: parseInt(get('Count'), 10) || snippets.length,
-      snippets
+      snippets,
+      viaOcr: get('Via OCR').toLowerCase() === 'yes'
     };
   });
 }

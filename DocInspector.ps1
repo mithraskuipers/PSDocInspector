@@ -181,6 +181,102 @@ function Get-PdfText {
     } catch { return '' }
 }
 
+# ---------- OCR (Windows.Media.Ocr + Windows.Data.Pdf - built into Windows 10+) ----------
+
+# Lazily resolves the generic AsTask<T>(IAsyncOperation<T>) and AsTask(IAsyncAction)
+# extension methods so WinRT async calls can be awaited synchronously from PowerShell,
+# which has no native "await". Resolved once and cached at script scope.
+function Initialize-WinRtAwait {
+    if ($script:AsTaskWithResult -and $script:AsTaskNoResult) { return }
+    Add-Type -AssemblyName System.Runtime.WindowsRuntime
+    $methods = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 }
+    $script:AsTaskWithResult = ($methods | Where-Object { $_.IsGenericMethod -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+    $script:AsTaskNoResult   = ($methods | Where-Object { -not $_.IsGenericMethod -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncAction' })[0]
+}
+
+function Wait-WinRtOperation {
+    param($Operation, [Type]$ResultType)
+    Initialize-WinRtAwait
+    $method = $script:AsTaskWithResult.MakeGenericMethod($ResultType)
+    $task = $method.Invoke($null, @($Operation))
+    $task.Wait() | Out-Null
+    return $task.Result
+}
+
+function Wait-WinRtAction {
+    param($Action)
+    Initialize-WinRtAwait
+    $task = $script:AsTaskNoResult.Invoke($null, @($Action))
+    $task.Wait() | Out-Null
+}
+
+# Checks (once) whether the Windows OCR + PDF rendering WinRT APIs are present
+# and an OCR engine can be created for one of the user's installed languages.
+# Result is cached in script scope, mirroring the Word/Excel COM availability checks.
+function Test-OcrAvailable {
+    if ($script:OcrChecked) { return $script:OcrReady }
+    $script:OcrChecked = $true
+    $script:OcrReady = $false
+    try {
+        [void][Windows.Media.Ocr.OcrEngine, Windows.Media.Ocr, ContentType = WindowsRuntime]
+        [void][Windows.Data.Pdf.PdfDocument, Windows.Data.Pdf, ContentType = WindowsRuntime]
+        [void][Windows.Storage.StorageFile, Windows.Storage, ContentType = WindowsRuntime]
+        [void][Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics, ContentType = WindowsRuntime]
+        [void][Windows.Storage.Streams.InMemoryRandomAccessStream, Windows.Storage.Streams, ContentType = WindowsRuntime]
+
+        $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
+        if (-not $engine) {
+            Write-Host 'OCR unavailable: no OCR language pack is installed for any user profile language.' -ForegroundColor Yellow
+            return $false
+        }
+        $script:OcrEngine = $engine
+        $script:OcrReady = $true
+    } catch {
+        Write-Host "OCR unavailable: $($_.Exception.Message)" -ForegroundColor Yellow
+        $script:OcrReady = $false
+    }
+    return $script:OcrReady
+}
+
+# Rasterizes each page of a PDF (via Windows.Data.Pdf) and runs Windows' built-in
+# OCR engine (Windows.Media.Ocr) against the rendered image, concatenating the
+# recognized text. Used only as a fallback for PDFs with no extractable text layer
+# (scanned/image-only PDFs). Returns $null if OCR itself is unavailable, or throws
+# on a genuine per-file failure so the caller can record a reason.
+function Get-PdfTextViaOcr {
+    param($Path)
+    if (-not (Test-OcrAvailable)) { return $null }
+
+    $storageFile = Wait-WinRtOperation ([Windows.Storage.StorageFile]::GetFileFromPathAsync($Path)) ([Windows.Storage.StorageFile])
+    $pdfDoc = Wait-WinRtOperation ([Windows.Data.Pdf.PdfDocument]::LoadFromFileAsync($storageFile)) ([Windows.Data.Pdf.PdfDocument])
+
+    $sb = New-Object System.Text.StringBuilder
+    $scale = 2.0 # upscale rendering for better OCR accuracy on small text
+
+    for ($i = 0; $i -lt $pdfDoc.PageCount; $i++) {
+        $page = $pdfDoc.GetPage([uint32]$i)
+        try {
+            $ras = New-Object Windows.Storage.Streams.InMemoryRandomAccessStream
+            $renderOptions = New-Object Windows.Data.Pdf.PdfPageRenderOptions
+            $renderOptions.DestinationWidth  = [uint32]([Math]::Ceiling($page.Size.Width  * $scale))
+            $renderOptions.DestinationHeight = [uint32]([Math]::Ceiling($page.Size.Height * $scale))
+            Wait-WinRtAction ($page.RenderToStreamAsync($ras, $renderOptions))
+
+            $decoder = Wait-WinRtOperation ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($ras)) ([Windows.Graphics.Imaging.BitmapDecoder])
+            $softwareBitmap = Wait-WinRtOperation ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+            $ocrResult = Wait-WinRtOperation ($script:OcrEngine.RecognizeAsync($softwareBitmap)) ([Windows.Media.Ocr.OcrResult])
+
+            if ($ocrResult -and $ocrResult.Text) {
+                [void]$sb.Append($ocrResult.Text).Append(' ')
+            }
+        } finally {
+            $page.Dispose()
+        }
+    }
+
+    return $sb.ToString()
+}
+
 function Get-RtfText {
     param($Path)
     try {
@@ -440,12 +536,15 @@ function Invoke-ScanRequest {
         }
 
         if ($reason) {
+            $ocrEligible = ($ext -eq '.pdf') -and ($reason -eq 'No extractable text found - likely a scanned or image-based PDF')
             $skipped += [PSCustomObject]@{
-                fileName  = $file.Name
-                directory = $file.DirectoryName
-                fullPath  = $file.FullName
-                extension = $ext
-                reason    = $reason
+                fileName     = $file.Name
+                directory    = $file.DirectoryName
+                fullPath     = $file.FullName
+                extension    = $ext
+                reason       = $reason
+                ocrEligible  = $ocrEligible
+                ocrAttempted = $false
             }
         } else {
             $scanned++
@@ -486,6 +585,116 @@ function Invoke-ScanRequest {
     $stream.Close()
 }
 
+# Re-runs keyword matching against a specific set of previously-skipped PDFs
+# using OCR text extraction (Get-PdfTextViaOcr) instead of the normal content-
+# stream parsing. Only intended for PDFs the client flagged as ocrEligible
+# (i.e. "no extractable text - likely scanned/image-based"), not encrypted or
+# genuinely corrupted files.
+function Invoke-OcrRequest {
+    param($Context)
+    $req = (Get-RequestBody -Context $Context) | ConvertFrom-Json
+
+    $items = @($req.items)
+    $keywords = @($req.keywords) | Where-Object { $_ -and $_.Trim() -ne '' } | ForEach-Object { $_.Trim() } | Select-Object -Unique
+    $caseSensitive = [bool]$req.caseSensitive
+    $wholeWord = [bool]$req.wholeWord
+    $useRegex = [bool]$req.useRegex
+
+    if ($items.Count -eq 0) {
+        Send-Json -Context $Context -StatusCode 400 -Data @{ error = 'No skipped PDFs were provided for OCR' }
+        return
+    }
+    if ($keywords.Count -eq 0) {
+        Send-Json -Context $Context -StatusCode 400 -Data @{ error = 'No keywords provided' }
+        return
+    }
+    if (-not (Test-OcrAvailable)) {
+        Send-Json -Context $Context -StatusCode 400 -Data @{ error = 'OCR is not available on this machine - the Windows OCR components (or a language pack) may not be installed' }
+        return
+    }
+
+    $Context.Response.ContentType = 'application/x-ndjson; charset=utf-8'
+    $Context.Response.SendChunked = $true
+    $stream = $Context.Response.OutputStream
+
+    Write-NdjsonLine -Stream $stream -Data @{ type = 'start'; totalFiles = $items.Count }
+
+    $results = @()
+    $stillSkipped = @()
+    $recoveredPaths = @()
+    $scanned = 0
+    $processed = 0
+
+    foreach ($item in $items) {
+        $fullPath = $item.fullPath
+        $reason = $null
+        $text = $null
+
+        if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) {
+            $reason = 'File no longer exists at the recorded path'
+        } else {
+            try {
+                $text = Get-PdfTextViaOcr -Path $fullPath
+            } catch {
+                $reason = "OCR error: $($_.Exception.Message)"
+            }
+        }
+
+        if (-not $reason -and [string]::IsNullOrWhiteSpace($text)) {
+            $reason = 'OCR completed but found no extractable text - the page(s) may be blank or unreadable'
+        }
+
+        if ($reason) {
+            $stillSkipped += [PSCustomObject]@{
+                fileName     = $item.fileName
+                directory    = $item.directory
+                fullPath     = $fullPath
+                extension    = $item.extension
+                reason       = $reason
+                ocrEligible  = $false
+                ocrAttempted = $true
+            }
+        } else {
+            $scanned++
+            $recoveredPaths += $fullPath
+            foreach ($kw in $keywords) {
+                $snippets = Find-KeywordMatches -Text $text -Keyword $kw -CaseSensitive $caseSensitive -WholeWord $wholeWord -UseRegex $useRegex
+                if ($snippets.Count -gt 0) {
+                    $results += [PSCustomObject]@{
+                        keyword   = $kw
+                        fileName  = $item.fileName
+                        directory = $item.directory
+                        fullPath  = $fullPath
+                        extension = $item.extension
+                        count     = $snippets.Count
+                        snippets  = $snippets | Select-Object -First 5
+                        viaOcr    = $true
+                    }
+                }
+            }
+        }
+
+        $processed++
+        Write-NdjsonLine -Stream $stream -Data @{
+            type        = 'progress'
+            processed   = $processed
+            total       = $items.Count
+            scanned     = $scanned
+            currentFile = $item.fileName
+        }
+    }
+
+    Write-NdjsonLine -Stream $stream -Data @{
+        type           = 'done'
+        results        = $results
+        skippedFiles   = $stillSkipped
+        recoveredPaths = $recoveredPaths
+        scannedFiles   = $scanned
+        totalFiles     = $items.Count
+    }
+    $stream.Close()
+}
+
 # ---------- Routing ----------
 
 function Handle-Request {
@@ -502,6 +711,10 @@ function Handle-Request {
         }
         '^/api/scan$' {
             if ($method -eq 'POST') { Invoke-ScanRequest -Context $Context }
+            else { $Context.Response.StatusCode = 405; $Context.Response.OutputStream.Close() }
+        }
+        '^/api/ocr$' {
+            if ($method -eq 'POST') { Invoke-OcrRequest -Context $Context }
             else { $Context.Response.StatusCode = 405; $Context.Response.OutputStream.Close() }
         }
         default {

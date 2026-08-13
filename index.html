@@ -113,9 +113,15 @@
   .snippet b { color: var(--text); }
   .full-path { font-family: var(--mono); font-size: 12px; color: var(--text); margin-bottom: 8px; word-break: break-all; }
 
-  .results-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+  .results-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; flex-wrap: wrap; gap: 10px; }
   .results-header .count { color: var(--muted); font-size: 12px; }
   .empty { color: var(--muted); text-align: center; padding: 30px; }
+
+  th.checkcol, td.checkcol { width: 28px; text-align: center; }
+  .badge { display: inline-block; font-size: 11px; padding: 2px 7px; border-radius: 10px; font-weight: 500; white-space: nowrap; }
+  .badge.eligible { background: rgba(79,140,255,0.15); color: var(--accent); }
+  .badge.attempted { background: rgba(139,147,163,0.15); color: var(--muted); }
+  .badge.viaocr { background: rgba(79,140,255,0.15); color: var(--accent); }
 </style>
 </head>
 <body>
@@ -161,6 +167,16 @@
     </div>
   </div>
 
+  <div class="panel" id="ocrProgressPanel" style="display:none;">
+    <div class="progress-header">
+      <span id="ocrProgressLabel">Preparing OCR...</span>
+      <span id="ocrProgressPercent">0%</span>
+    </div>
+    <div class="progress-track">
+      <div class="progress-fill" id="ocrProgressBarFill"></div>
+    </div>
+  </div>
+
   <div class="panel" id="filterPanel" style="display:none;">
     <div class="row">
       <label>Filter keyword</label>
@@ -199,14 +215,19 @@
   <div class="panel" id="skippedPanel" style="display:none;">
     <div class="results-header">
       <div class="count" id="skippedCount"></div>
+      <div class="row">
+        <button class="secondary" id="ocrBtn" disabled>Run OCR on selected PDFs</button>
+      </div>
     </div>
     <table>
       <thead>
         <tr>
+          <th class="checkcol"><input type="checkbox" id="ocrSelectAll" title="Select/deselect all OCR-eligible PDFs"></th>
           <th>File</th>
           <th>Ext</th>
           <th>Directory</th>
           <th>Reason - requires manual inspection</th>
+          <th>OCR</th>
         </tr>
       </thead>
       <tbody id="skippedBody"></tbody>
