@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>DocInspector</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --border: #262b36;
+    --text: #e4e6eb;
+    --muted: #8b93a3;
+    --accent: #4f8cff;
+    --accent-dim: #2c4a80;
+    --danger: #ff5c5c;
+    --mono: 'Consolas', 'SFMono-Regular', Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+    font-size: 14px;
+  }
+  header {
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  header h1 { font-size: 18px; margin: 0; font-weight: 600; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  main { padding: 20px 24px; max-width: 1400px; margin: 0 auto; }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 16px;
+  }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .row + .row { margin-top: 10px; }
+  label { color: var(--muted); font-size: 12px; }
+  input[type=text], textarea {
+    background: #0d0f13;
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-family: inherit;
+    font-size: 13px;
+  }
+  input[type=text] { flex: 1; min-width: 200px; }
+  textarea { width: 100%; min-height: 60px; resize: vertical; font-family: var(--mono); }
+  button {
+    background: var(--accent);
+    color: white;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 14px;
+    font-size: 13px;
+    cursor: pointer;
+    font-weight: 500;
+  }
+  button:hover { background: #3d7ae0; }
+  button.secondary { background: #2a2f3a; }
+  button.secondary:hover { background: #363c49; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .checkbox-row { display: flex; align-items: center; gap: 6px; }
+  .checkbox-row label { color: var(--text); font-size: 13px; }
+
+  #status { color: var(--muted); font-size: 12px; margin-top: 8px; min-height: 16px; }
+  #status.error { color: var(--danger); }
+
+  .progress-header { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+  #progressLabel { color: var(--text); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #progressPercent { color: var(--accent); font-family: var(--mono); font-size: 13px; flex-shrink: 0; }
+  .progress-track {
+    width: 100%;
+    height: 8px;
+    background: #0d0f13;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    overflow: hidden;
+    margin-top: 8px;
+  }
+  .progress-fill {
+    height: 100%;
+    width: 0%;
+    background: var(--accent);
+    transition: width 0.15s ease;
+  }
+
+  table { width: 100%; border-collapse: collapse; }
+  th, td {
+    text-align: left;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+  }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: 0.03em; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: #1c2029; }
+  td.keyword { color: var(--accent); font-family: var(--mono); }
+  td.dir { color: var(--muted); font-family: var(--mono); font-size: 12px; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  td.count { text-align: right; font-family: var(--mono); }
+  td.reason { color: var(--danger); font-size: 12.5px; }
+  tr.detail-row td { background: #12151b; cursor: default; }
+  .snippet { font-family: var(--mono); font-size: 12px; color: var(--muted); padding: 3px 0; }
+  .snippet b { color: var(--text); }
+  .full-path { font-family: var(--mono); font-size: 12px; color: var(--text); margin-bottom: 8px; word-break: break-all; }
+
+  .results-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+  .results-header .count { color: var(--muted); font-size: 12px; }
+  .empty { color: var(--muted); text-align: center; padding: 30px; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>DocInspector</h1>
+    <div class="sub">Keyword search across office documents</div>
+  </div>
+</header>
+<main>
+
+  <div class="panel">
+    <div class="row">
+      <label style="min-width: 45px;">Folder</label>
+      <input type="text" id="folderPath" placeholder="C:\path\to\folder">
+      <button class="secondary" id="browseBtn">Browse...</button>
+      <div class="checkbox-row">
+        <input type="checkbox" id="recursive" checked>
+        <label for="recursive">Include subfolders</label>
+      </div>
+    </div>
+    <div class="row">
+      <textarea id="keywords" placeholder="Keywords, one per line or comma separated"></textarea>
+    </div>
+    <div class="row">
+      <div class="checkbox-row"><input type="checkbox" id="caseSensitive"><label for="caseSensitive">Case sensitive</label></div>
+      <div class="checkbox-row"><input type="checkbox" id="wholeWord"><label for="wholeWord">Whole word</label></div>
+      <div class="checkbox-row"><input type="checkbox" id="useRegex"><label for="useRegex">Regex</label></div>
+      <button id="scanBtn">Scan</button>
+      <button class="secondary" id="importBtn">Import results...</button>
+      <input type="file" id="importFile" accept=".json,.txt" style="display:none">
+    </div>
+    <div id="status"></div>
+  </div>
+
+  <div class="panel" id="progressPanel" style="display:none;">
+    <div class="progress-header">
+      <span id="progressLabel">Preparing scan...</span>
+      <span id="progressPercent">0%</span>
+    </div>
+    <div class="progress-track">
+      <div class="progress-fill" id="progressBarFill"></div>
+    </div>
+  </div>
+
+  <div class="panel" id="filterPanel" style="display:none;">
+    <div class="row">
+      <label>Filter keyword</label>
+      <select id="filterKeyword" style="background:#0d0f13;color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 8px;"></select>
+      <label>Directory contains</label>
+      <input type="text" id="filterDir" style="max-width:220px;">
+      <label>File name contains</label>
+      <input type="text" id="filterFile" style="max-width:220px;">
+      <button class="secondary" id="clearFilters">Clear filters</button>
+    </div>
+  </div>
+
+  <div class="panel" id="resultsPanel" style="display:none;">
+    <div class="results-header">
+      <div class="count" id="resultsCount"></div>
+      <div class="row">
+        <button class="secondary" id="exportJson">Download JSON</button>
+        <button class="secondary" id="exportTxt">Download TXT</button>
+      </div>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>Keyword</th>
+          <th>File</th>
+          <th>Ext</th>
+          <th style="text-align:right;">Matches</th>
+          <th>Directory</th>
+        </tr>
+      </thead>
+      <tbody id="resultsBody"></tbody>
+    </table>
+    <div class="empty" id="emptyState" style="display:none;">No results match the current filters.</div>
+  </div>
+
+  <div class="panel" id="skippedPanel" style="display:none;">
+    <div class="results-header">
+      <div class="count" id="skippedCount"></div>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>File</th>
+          <th>Ext</th>
+          <th>Directory</th>
+          <th>Reason - requires manual inspection</th>
+        </tr>
+      </thead>
+      <tbody id="skippedBody"></tbody>
+    </table>
+  </div>
+
+</main>
+<script src="/app.js"></script>
+</body>
+</html>
