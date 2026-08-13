@@ -90,24 +90,94 @@ function Get-XlsText {
     } catch { return $null }
 }
 
+function Expand-FlateBytes {
+    param([byte[]]$Bytes)
+    if (-not $Bytes -or $Bytes.Length -lt 3) { return $null }
+
+    # PDF FlateDecode streams are zlib-wrapped (RFC 1950): a 2-byte header
+    # followed by raw DEFLATE data and a 4-byte Adler-32 trailer. .NET's
+    # DeflateStream only understands the raw DEFLATE payload (RFC 1951), so
+    # the zlib header is stripped before decompressing. If that fails (e.g.
+    # a non-standard header), fall back to treating the bytes as raw DEFLATE
+    # with no header at all rather than throwing.
+    foreach ($offset in @(2, 0)) {
+        if ($offset -ge $Bytes.Length) { continue }
+        $input = $null
+        $deflate = $null
+        $output = $null
+        try {
+            $input = New-Object System.IO.MemoryStream(, $Bytes)
+            [void]$input.Seek($offset, [System.IO.SeekOrigin]::Begin)
+            $deflate = New-Object System.IO.Compression.DeflateStream($input, [System.IO.Compression.CompressionMode]::Decompress)
+            $output = New-Object System.IO.MemoryStream
+            $deflate.CopyTo($output)
+            if ($output.Length -gt 0) { return $output.ToArray() }
+        } catch {
+            # Corrupt/unsupported stream data - try the next offset (or give
+            # up and let the caller treat this stream as unavailable).
+        } finally {
+            if ($deflate) { $deflate.Close() }
+            if ($input) { $input.Close() }
+        }
+    }
+    return $null
+}
+
 function Get-PdfText {
     param($Path)
     try {
         $bytes = [System.IO.File]::ReadAllBytes($Path)
-        $raw = [System.Text.Encoding]::GetEncoding('ISO-8859-1').GetString($bytes)
+        $encoding = [System.Text.Encoding]::GetEncoding('ISO-8859-1')
+        $raw = $encoding.GetString($bytes)
+
+        # Start from the raw file text so existing behavior for uncompressed
+        # content streams (literal "(text) Tj" operators sitting directly in
+        # the file) is preserved unchanged.
         $sb = New-Object System.Text.StringBuilder
-        foreach ($m in [regex]::Matches($raw, '\(((?:[^()\\]|\\.)*)\)\s*Tj')) {
-            $s = $m.Groups[1].Value -replace '\\\(', '(' -replace '\\\)', ')' -replace '\\\\', '\'
-            [void]$sb.Append($s).Append(' ')
+        [void]$sb.Append($raw)
+
+        # Locate stream objects whose dictionary declares /FlateDecode,
+        # decompress their data with DeflateStream, and append the
+        # decompressed text so the same Tj/TJ extraction below also picks up
+        # text from compressed content streams (the common case for PDFs
+        # produced by Word, Chrome, Adobe, etc).
+        $streamPattern = New-Object System.Text.RegularExpressions.Regex(
+            '<<(?<dict>(?:[^<>]|<<[^<>]*>>)*)>>\s*stream\r?\n(?<data>.*?)\r?\n?endstream',
+            [System.Text.RegularExpressions.RegexOptions]::Singleline
+        )
+
+        foreach ($m in $streamPattern.Matches($raw)) {
+            $dict = $m.Groups['dict'].Value
+            if ($dict -notmatch '/FlateDecode') { continue }
+
+            try {
+                $streamBytes = $encoding.GetBytes($m.Groups['data'].Value)
+                $decompressed = Expand-FlateBytes -Bytes $streamBytes
+                if ($decompressed) {
+                    [void]$sb.Append(' ').Append($encoding.GetString($decompressed))
+                }
+            } catch {
+                # Decompression failed for this stream (corrupt/unsupported) -
+                # skip it and keep processing the rest of the document
+                # instead of failing the whole extraction.
+                continue
+            }
         }
-        foreach ($m in [regex]::Matches($raw, '\[((?:[^\[\]])*)\]\s*TJ')) {
+
+        $combined = $sb.ToString()
+        $out = New-Object System.Text.StringBuilder
+        foreach ($m in [regex]::Matches($combined, '\(((?:[^()\\]|\\.)*)\)\s*Tj')) {
+            $s = $m.Groups[1].Value -replace '\\\(', '(' -replace '\\\)', ')' -replace '\\\\', '\'
+            [void]$out.Append($s).Append(' ')
+        }
+        foreach ($m in [regex]::Matches($combined, '\[((?:[^\[\]])*)\]\s*TJ')) {
             foreach ($im in [regex]::Matches($m.Groups[1].Value, '\(((?:[^()\\]|\\.)*)\)')) {
                 $s = $im.Groups[1].Value -replace '\\\(', '(' -replace '\\\)', ')' -replace '\\\\', '\'
-                [void]$sb.Append($s)
+                [void]$out.Append($s)
             }
-            [void]$sb.Append(' ')
+            [void]$out.Append(' ')
         }
-        return $sb.ToString()
+        return $out.ToString()
     } catch { return '' }
 }
 
