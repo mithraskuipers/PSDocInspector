@@ -6,6 +6,7 @@ $ErrorActionPreference = 'Stop'
 $WwwRoot = $PSScriptRoot
 $script:WordApp = $null
 $script:ExcelApp = $null
+$script:OcrUnavailableReason = $null
 
 # ---------- Text extraction ----------
 
@@ -217,6 +218,18 @@ function Test-OcrAvailable {
     if ($script:OcrChecked) { return $script:OcrReady }
     $script:OcrChecked = $true
     $script:OcrReady = $false
+
+    # The WinRT type projections this feature relies on (Windows.Media.Ocr,
+    # Windows.Data.Pdf, etc.) are only available under Windows PowerShell 5.1.
+    # PowerShell 7/Core dropped WinRT support, so fail fast here with a clear,
+    # user-facing reason instead of letting a cryptic type-resolution error
+    # surface later.
+    if ($PSVersionTable.PSEdition -eq 'Core') {
+        $script:OcrUnavailableReason = 'OCR requires Windows PowerShell 5.1 (powershell.exe). This server was started with PowerShell 7/Core, which does not support the Windows Runtime APIs OCR depends on - restart it with powershell.exe instead of pwsh.exe.'
+        Write-Host "OCR unavailable: $($script:OcrUnavailableReason)" -ForegroundColor Yellow
+        return $false
+    }
+
     try {
         [void][Windows.Media.Ocr.OcrEngine, Windows.Media.Ocr, ContentType = WindowsRuntime]
         [void][Windows.Data.Pdf.PdfDocument, Windows.Data.Pdf, ContentType = WindowsRuntime]
@@ -226,13 +239,15 @@ function Test-OcrAvailable {
 
         $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
         if (-not $engine) {
-            Write-Host 'OCR unavailable: no OCR language pack is installed for any user profile language.' -ForegroundColor Yellow
+            $script:OcrUnavailableReason = 'No OCR language pack is installed for any of your Windows display languages. Install one via Settings > Time & language > Language & region > (your language) > Options > Optical character recognition.'
+            Write-Host "OCR unavailable: $($script:OcrUnavailableReason)" -ForegroundColor Yellow
             return $false
         }
         $script:OcrEngine = $engine
         $script:OcrReady = $true
     } catch {
-        Write-Host "OCR unavailable: $($_.Exception.Message)" -ForegroundColor Yellow
+        $script:OcrUnavailableReason = "OCR unavailable: $($_.Exception.Message)"
+        Write-Host $script:OcrUnavailableReason -ForegroundColor Yellow
         $script:OcrReady = $false
     }
     return $script:OcrReady
@@ -609,7 +624,8 @@ function Invoke-OcrRequest {
         return
     }
     if (-not (Test-OcrAvailable)) {
-        Send-Json -Context $Context -StatusCode 400 -Data @{ error = 'OCR is not available on this machine - the Windows OCR components (or a language pack) may not be installed' }
+        $reason = if ($script:OcrUnavailableReason) { $script:OcrUnavailableReason } else { 'OCR is not available on this machine.' }
+        Send-Json -Context $Context -StatusCode 400 -Data @{ error = $reason }
         return
     }
 
@@ -708,6 +724,10 @@ function Handle-Request {
         '^/api/browse$' {
             $selected = Show-FolderBrowserDialog
             Send-Json -Context $Context -Data @{ path = $selected }
+        }
+        '^/api/ocr-status$' {
+            $ready = Test-OcrAvailable
+            Send-Json -Context $Context -Data @{ available = $ready; reason = $(if (-not $ready) { $script:OcrUnavailableReason }) }
         }
         '^/api/scan$' {
             if ($method -eq 'POST') { Invoke-ScanRequest -Context $Context }

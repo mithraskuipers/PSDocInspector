@@ -6,7 +6,9 @@ let state = {
   totalFiles: 0,
   expandedRow: null,
   ocrSelected: new Set(), // fullPaths of skipped, OCR-eligible PDFs currently checked
-  ocrRunning: false
+  ocrRunning: false,
+  ocrAvailable: null, // null = not checked yet, true/false once /api/ocr-status responds
+  ocrUnavailableReason: ''
 };
 
 const $ = (id) => document.getElementById(id);
@@ -174,6 +176,24 @@ function parseNdjsonLine(line) {
   }
 }
 
+// ---------- OCR availability ----------
+
+// Checked once on load so the button/label reflect reality immediately
+// instead of only failing when the user clicks "Run OCR".
+async function checkOcrAvailability() {
+  try {
+    const res = await fetch('/api/ocr-status');
+    const data = await res.json();
+    state.ocrAvailable = !!data.available;
+    state.ocrUnavailableReason = data.reason || '';
+  } catch (e) {
+    state.ocrAvailable = false;
+    state.ocrUnavailableReason = 'Could not reach the server to check OCR availability.';
+  }
+  updateOcrButton();
+}
+checkOcrAvailability();
+
 // ---------- OCR rescan of skipped PDFs ----------
 
 function showOcrProgress(visible) {
@@ -195,6 +215,12 @@ $('ocrBtn').addEventListener('click', async () => {
 
   const keywords = parseKeywords($('keywords').value);
   if (keywords.length === 0) { setStatus('Enter at least one keyword before running OCR.', true); return; }
+
+  const proceed = confirm(
+    `Run OCR on ${items.length} original PDF file${items.length === 1 ? '' : 's'}?\n\n` +
+    `This opens and renders each PDF directly to recognize text, which can take a while for large or multi-page files.`
+  );
+  if (!proceed) return;
 
   state.ocrRunning = true;
   updateOcrButton();
@@ -397,7 +423,19 @@ function syncOcrSelectAll() {
 
 function updateOcrButton() {
   const btn = $('ocrBtn');
+  const note = $('ocrStatusNote');
   const count = state.ocrSelected.size;
+
+  if (state.ocrAvailable === false) {
+    btn.textContent = 'OCR unavailable';
+    btn.disabled = true;
+    btn.title = state.ocrUnavailableReason || 'OCR is not available on this machine.';
+    if (note) note.textContent = state.ocrUnavailableReason ? `OCR unavailable \u2014 ${state.ocrUnavailableReason}` : 'OCR unavailable on this machine.';
+    return;
+  }
+
+  btn.title = '';
+  if (note) note.textContent = '';
   btn.textContent = count ? `Run OCR on ${count} selected PDF${count === 1 ? '' : 's'}` : 'Run OCR on selected PDFs';
   btn.disabled = state.ocrRunning || count === 0;
 }

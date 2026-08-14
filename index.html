@@ -144,6 +144,9 @@
       </div>
     </div>
     <div class="row">
+      <span style="color:var(--muted); font-size:11.5px;">Supports .docx, .doc, .xlsx, .xls, .pdf, .rtf, .txt &mdash; legacy .doc/.xls files additionally require Microsoft Word/Excel to be installed on this machine, or they'll be skipped and flagged for manual inspection.</span>
+    </div>
+    <div class="row">
       <textarea id="keywords" placeholder="Keywords, one per line or comma separated"></textarea>
     </div>
     <div class="row">
@@ -216,6 +219,7 @@
     <div class="results-header">
       <div class="count" id="skippedCount"></div>
       <div class="row">
+        <span id="ocrStatusNote" style="color:var(--muted); font-size:12px;"></span>
         <button class="secondary" id="ocrBtn" disabled>Run OCR on selected PDFs</button>
       </div>
     </div>
