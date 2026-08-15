@@ -332,16 +332,18 @@ function getFilteredResults() {
   const kw = $('filterKeyword').value.toLowerCase();
   const dir = $('filterDir').value.toLowerCase();
   const file = $('filterFile').value.toLowerCase();
+  const snippet = $('filterSnippet').value.toLowerCase();
 
   return state.results.filter(r => {
     if (kw && r.keyword.toLowerCase() !== kw) return false;
     if (dir && !(r.directory || '').toLowerCase().includes(dir)) return false;
     if (file && !(r.fileName || '').toLowerCase().includes(file)) return false;
+    if (snippet && !(r.snippets || []).some(s => s.toLowerCase().includes(snippet))) return false;
     return true;
   });
 }
 
-['filterKeyword', 'filterDir', 'filterFile'].forEach(id => {
+['filterKeyword', 'filterDir', 'filterFile', 'filterSnippet'].forEach(id => {
   $(id).addEventListener('input', renderResults);
   $(id).addEventListener('change', renderResults);
 });
@@ -350,6 +352,7 @@ $('clearFilters').addEventListener('click', () => {
   $('filterKeyword').value = '';
   $('filterDir').value = '';
   $('filterFile').value = '';
+  $('filterSnippet').value = '';
   renderResults();
 });
 
@@ -359,8 +362,23 @@ function escapeHtml(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
+function escapeRegExp(s) {
+  return String(s ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Wraps case-insensitive matches of `term` in <mark> within already-escaped
+// HTML, so the "search within results" filter is visible right in the
+// snippet text when a row is expanded.
+function highlightTerm(escapedHtml, term) {
+  if (!term) return escapedHtml;
+  const escapedTerm = escapeHtml(term);
+  const re = new RegExp(escapeRegExp(escapedTerm), 'gi');
+  return escapedHtml.replace(re, m => `<mark>${m}</mark>`);
+}
+
 function renderResults() {
   const filtered = getFilteredResults();
+  const snippetTerm = $('filterSnippet').value.trim();
   const body = $('resultsBody');
   body.innerHTML = '';
   $('resultsPanel').style.display = state.results.length ? 'block' : 'none';
@@ -376,7 +394,7 @@ function renderResults() {
       <td class="count">${r.count}</td>
       <td class="dir" title="${escapeHtml(r.fullPath)}">${escapeHtml(r.directory)}</td>
     `;
-    tr.addEventListener('click', () => toggleDetail(tr, r, idx));
+    tr.addEventListener('click', () => toggleDetail(tr, r, idx, snippetTerm));
     const link = tr.querySelector('.filename-link');
     link.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -511,7 +529,7 @@ $('ocrSelectAll').addEventListener('change', () => {
   renderSkipped();
 });
 
-function toggleDetail(tr, r, idx) {
+function toggleDetail(tr, r, idx, snippetTerm) {
   const existing = tr.nextElementSibling;
   if (existing && existing.classList.contains('detail-row')) {
     existing.remove();
@@ -521,11 +539,19 @@ function toggleDetail(tr, r, idx) {
 
   const detail = document.createElement('tr');
   detail.className = 'detail-row';
-  const snippets = (r.snippets || []).map(s => `<div class="snippet">${escapeHtml(s)}</div>`).join('');
+  // When "search within results" is active, only show snippets that
+  // actually match it (still highlighted), rather than all of them.
+  const term = (snippetTerm || '').trim();
+  const allSnippets = r.snippets || [];
+  const matching = term
+    ? allSnippets.filter(s => s.toLowerCase().includes(term.toLowerCase()))
+    : allSnippets;
+  const snippets = matching.map(s => `<div class="snippet">${highlightTerm(escapeHtml(s), term)}</div>`).join('');
+  const noneMsg = term ? 'No snippet matches your search within results' : 'No snippet available';
   detail.innerHTML = `
     <td colspan="5">
       <div class="full-path">${escapeHtml(r.fullPath)}</div>
-      ${snippets || '<div class="snippet">No snippet available</div>'}
+      ${snippets || `<div class="snippet">${noneMsg}</div>`}
     </td>
   `;
   tr.after(detail);

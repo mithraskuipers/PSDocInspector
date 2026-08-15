@@ -114,6 +114,7 @@
   tr.detail-row td { background: #12151b; cursor: default; }
   .snippet { font-family: var(--mono); font-size: 12px; color: var(--muted); padding: 3px 0; }
   .snippet b { color: var(--text); }
+  .snippet mark { background: var(--accent-dim); color: var(--text); padding: 0 2px; border-radius: 2px; }
   .full-path { font-family: var(--mono); font-size: 12px; color: var(--text); margin-bottom: 8px; word-break: break-all; }
 
   .results-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; flex-wrap: wrap; gap: 10px; }
@@ -194,6 +195,10 @@
       <label>File name contains</label>
       <input type="text" id="filterFile" style="max-width:220px;">
       <button class="secondary" id="clearFilters">Clear filters</button>
+    </div>
+    <div class="row">
+      <label>Search within results</label>
+      <input type="text" id="filterSnippet" placeholder="e.g. password =" style="min-width:260px;">
     </div>
   </div>
 
