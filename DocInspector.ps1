@@ -245,6 +245,72 @@ function Get-DocHtmlText {
     }
 }
 
+function Get-BinaryHeuristicText {
+    <#
+        Extracts human-readable text from legacy binary Office files (.doc,
+        .xls) WITHOUT any dependency on Word/Excel being installed, licensed,
+        or COM-automatable. Both formats store their text content as
+        contiguous runs of either UTF-16LE code units or single-byte
+        CP1252/ANSI characters, even though it's embedded inside a larger
+        binary container (OLE Compound File structures, formatting records,
+        etc). This walks the raw bytes and, at every position, greedily
+        matches the longer of a UTF-16LE-printable run or an 8-bit-printable
+        run, emits it as decoded text, and skips forward past non-text bytes.
+        This is deliberately the same technique the classic 'strings' utility
+        uses - it doesn't reconstruct document structure or reading order
+        perfectly, but for keyword search purposes (the only thing this tool
+        needs) it reliably recovers the actual words in the file regardless
+        of whether Word is present, licensed, or currently able to start.
+        Runs shorter than $MinRun are treated as noise (stray printable bytes
+        inside binary formatting records) and discarded.
+    #>
+    param($Path, [int]$MinRun = 5)
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($Path)
+    } catch {
+        return ''
+    }
+    $n = $bytes.Length
+    if ($n -eq 0) { return '' }
+    $ansi = [System.Text.Encoding]::GetEncoding(1252)
+    $sb = New-Object System.Text.StringBuilder
+    $i = 0
+    while ($i -lt $n) {
+        # Longest run readable as UTF-16LE starting at $i.
+        $j = $i
+        while (($j + 1) -lt $n) {
+            $code = $bytes[$j] -bor ($bytes[$j + 1] -shl 8)
+            $printable = ($code -eq 9 -or $code -eq 10 -or $code -eq 13) -or
+                         ($code -ge 32 -and $code -le 126) -or
+                         ($code -ge 160 -and $code -le 0xFFFD -and $code -ne 0xFEFF)
+            if (-not $printable) { break }
+            $j += 2
+        }
+        $run16 = $j - $i
+
+        # Longest run readable as 8-bit CP1252 starting at $i.
+        $k = $i
+        while ($k -lt $n) {
+            $b = $bytes[$k]
+            if ($b -eq 9 -or $b -eq 10 -or $b -eq 13 -or ($b -ge 32 -and $b -le 126) -or $b -ge 128) {
+                $k++
+            } else { break }
+        }
+        $run8 = $k - $i
+
+        if ($run16 -ge ($MinRun * 2) -and $run16 -ge $run8) {
+            [void]$sb.Append([System.Text.Encoding]::Unicode.GetString($bytes, $i, $run16)).Append(' ')
+            $i = $j
+        } elseif ($run8 -ge $MinRun) {
+            [void]$sb.Append($ansi.GetString($bytes, $i, $run8)).Append(' ')
+            $i = $k
+        } else {
+            $i++
+        }
+    }
+    return $sb.ToString()
+}
+
 function Get-DocText {
     <#
         Extracts text from a genuine binary .doc via the Word COM object.
@@ -265,16 +331,34 @@ function Get-DocText {
         return $null
     }
     if (-not $script:WordApp) {
-        try {
-            $script:WordApp = New-Object -ComObject Word.Application
-            $script:WordApp.Visible = $false
-        } catch {
+        # Try twice: a fresh Click-to-Run session or a just-released COM
+        # registration can throw a transient "Unable to cast COM object..."
+        # / QueryInterface error on the very first activation attempt and
+        # then succeed immediately after. One retry (with the object
+        # released in between) resolves that without ever touching other
+        # processes on the machine.
+        $lastError = $null
+        for ($attempt = 1; $attempt -le 2; $attempt++) {
+            try {
+                $script:WordApp = New-Object -ComObject Word.Application -Property @{ Visible = $false }
+                $lastError = $null
+                break
+            } catch {
+                $lastError = $_
+                if ($script:WordApp) {
+                    try { [Runtime.InteropServices.Marshal]::ReleaseComObject($script:WordApp) | Out-Null } catch {}
+                    $script:WordApp = $null
+                }
+                if ($attempt -lt 2) { Start-Sleep -Milliseconds 800 }
+            }
+        }
+        if ($lastError) {
             $script:WordFailed = $true
             # Keep the actual COM error around separately from the
             # 'unavailable' sentinel so the caller can surface the real
             # reason (e.g. a registration/permission problem) instead of
             # always claiming Word isn't installed when it actually is.
-            $script:WordUnavailableReason = $_.Exception.Message
+            $script:WordUnavailableReason = $lastError.Exception.Message
             $script:LastDocOpenError = 'unavailable'
             return $null
         }
@@ -294,12 +378,24 @@ function Get-XlsText {
     param($Path)
     if ($script:ExcelFailed) { return $null }
     if (-not $script:ExcelApp) {
-        try {
-            $script:ExcelApp = New-Object -ComObject Excel.Application
-            $script:ExcelApp.Visible = $false
-            $script:ExcelApp.DisplayAlerts = $false
-        } catch {
+        $lastError = $null
+        for ($attempt = 1; $attempt -le 2; $attempt++) {
+            try {
+                $script:ExcelApp = New-Object -ComObject Excel.Application -Property @{ Visible = $false; DisplayAlerts = $false }
+                $lastError = $null
+                break
+            } catch {
+                $lastError = $_
+                if ($script:ExcelApp) {
+                    try { [Runtime.InteropServices.Marshal]::ReleaseComObject($script:ExcelApp) | Out-Null } catch {}
+                    $script:ExcelApp = $null
+                }
+                if ($attempt -lt 2) { Start-Sleep -Milliseconds 800 }
+            }
+        }
+        if ($lastError) {
             $script:ExcelFailed = $true
+            $script:ExcelUnavailableReason = $lastError.Exception.Message
             return $null
         }
     }
@@ -538,29 +634,53 @@ function Get-FileText {
             # Confluence export .doc files that are actually HTML or MHTML.
             # Detect the real format from content, not the extension.
             if (Test-IsOleCompoundFile -Path $Path) {
-                $text = Get-DocText -Path $Path
-                if ($null -ne $text) { return $text }
+                # Primary path: byte-level heuristic extraction. Needs no
+                # Word install/license/COM cooperation at all, so this alone
+                # already covers the overwhelming majority of real .doc
+                # files even on a machine where Word automation is fully
+                # broken.
+                $heuristicText = Get-BinaryHeuristicText -Path $Path
 
-                # Word couldn't produce text for this file - either it isn't
-                # actually available, or it choked on this specific file even
-                # though it opened fine for others. Either way, try the
-                # HTML/MHTML extractor as a fallback: it needs no Word
-                # dependency at all, so it costs nothing to attempt, and it
-                # recovers files that merely *look* like binary docs (e.g. an
-                # OLE-wrapped file with embedded HTML) or where Word's own
-                # open attempt failed for an unrelated reason.
+                # Word COM is now purely a bonus, tried only when the
+                # heuristic came back thin (e.g. a file that's mostly
+                # non-text runs it couldn't recover well), and only ever
+                # used if it actually beats what the heuristic already
+                # found. A broken/unavailable Word install can no longer
+                # cause a file to be skipped - it can only fail to improve
+                # on a result we already have.
+                if ([string]::IsNullOrWhiteSpace($heuristicText) -or $heuristicText.Trim().Length -lt 40) {
+                    $wordText = Get-DocText -Path $Path
+                    if ($wordText -and $wordText.Trim().Length -gt $heuristicText.Trim().Length) {
+                        return $wordText
+                    }
+                }
+
+                if (-not [string]::IsNullOrWhiteSpace($heuristicText)) { return $heuristicText }
+
+                # Heuristic found nothing usable either - try the HTML/MHTML
+                # extractor as a last resort (covers OLE-wrapped files with
+                # embedded HTML/XML content the byte scanner isn't tuned for).
                 $htmlText = Get-DocHtmlText -Path $Path
                 if (-not [string]::IsNullOrWhiteSpace($htmlText)) { return $htmlText }
 
-                # Neither path produced anything - return $null so the
-                # existing "Word not available" / open-error reporting in
-                # Invoke-ScanRequest still applies below.
                 return $null
             } else {
                 return Get-DocHtmlText -Path $Path
             }
         }
-        '.xls'  { return Get-XlsText -Path $Path }
+        '.xls'  {
+            # Same heuristic-first approach as .doc: BIFF (.xls) binary
+            # records also store cell strings as recoverable UTF-16LE/CP1252
+            # runs, so this needs no Excel install at all for the common case.
+            $heuristicText = Get-BinaryHeuristicText -Path $Path
+            if ([string]::IsNullOrWhiteSpace($heuristicText) -or $heuristicText.Trim().Length -lt 40) {
+                $excelText = Get-XlsText -Path $Path
+                if ($excelText -and $excelText.Trim().Length -gt $heuristicText.Trim().Length) {
+                    return $excelText
+                }
+            }
+            return $heuristicText
+        }
         '.pdf'  { return Get-PdfText -Path $Path }
         '.rtf'  { return Get-RtfText -Path $Path }
         '.txt'  { return Get-Content -LiteralPath $Path -Raw -ErrorAction SilentlyContinue }
@@ -832,7 +952,13 @@ function Invoke-ScanRequest {
                             'Microsoft Word is not available on this machine - legacy .doc files require Word to be installed'
                         }
                     }
-                    '.xls'  { 'Microsoft Excel is not available on this machine - legacy .xls files require Excel to be installed' }
+                    '.xls'  {
+                        if ($script:ExcelUnavailableReason) {
+                            "Microsoft Excel could not be started - $($script:ExcelUnavailableReason)"
+                        } else {
+                            'Microsoft Excel is not available on this machine - legacy .xls files require Excel to be installed'
+                        }
+                    }
                     '.pdf'  { 'Could not extract text - the PDF may be encrypted, corrupted, or use an unsupported structure' }
                     '.rtf'  { 'Could not read RTF content' }
                     default { 'Could not extract text from this file' }
@@ -1064,6 +1190,17 @@ function Handle-Request {
 # (".\DocInspector.ps1") is unaffected - $MyInvocation.InvocationName is only
 # '.' when the script is dot-sourced.
 if ($MyInvocation.InvocationName -eq '.') { return }
+
+if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
+    Write-Host ''
+    Write-Host 'DocInspector must run in a Single-Threaded Apartment (STA) to automate Word/Excel.' -ForegroundColor Red
+    Write-Host "This session is currently $([System.Threading.Thread]::CurrentThread.GetApartmentState()), which will make every legacy .doc/.xls file fail." -ForegroundColor Red
+    Write-Host 'Relaunch with:' -ForegroundColor Yellow
+    Write-Host "  pwsh -sta -File `"$PSCommandPath`""
+    Write-Host "  (or) powershell.exe -sta -File `"$PSCommandPath`""
+    Write-Host ''
+    exit 1
+}
 
 $listener = New-Object System.Net.HttpListener
 $prefix = "http://localhost:$Port/"
