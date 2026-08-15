@@ -842,11 +842,12 @@ function Invoke-ScanRequest {
 
         $processed++
         Write-NdjsonLine -Stream $stream -Data @{
-            type        = 'progress'
-            processed   = $processed
-            total       = $files.Count
-            scanned     = $scanned
-            currentFile = $file.Name
+            type          = 'progress'
+            processed     = $processed
+            total         = $files.Count
+            scanned       = $scanned
+            currentFile   = $file.Name
+            findingsCount = $results.Count
         }
     }
 
@@ -953,11 +954,12 @@ function Invoke-OcrRequest {
 
         $processed++
         Write-NdjsonLine -Stream $stream -Data @{
-            type        = 'progress'
-            processed   = $processed
-            total       = $items.Count
-            scanned     = $scanned
-            currentFile = $item.fileName
+            type          = 'progress'
+            processed     = $processed
+            total         = $items.Count
+            scanned       = $scanned
+            currentFile   = $item.fileName
+            findingsCount = $results.Count
         }
     }
 

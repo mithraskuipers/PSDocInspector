@@ -50,13 +50,46 @@ function showProgress(visible) {
   $('progressPanel').style.display = visible ? 'block' : 'none';
 }
 
-function setProgress(processed, total, currentFile) {
+function setProgress(processed, total, currentFile, findingsCount) {
   const pct = total > 0 ? Math.round((processed / total) * 100) : 0;
   $('progressBarFill').style.width = pct + '%';
   $('progressPercent').textContent = pct + '%';
   $('progressLabel').textContent = total > 0
     ? `${processed} of ${total} file(s) scanned${currentFile ? ' \u2014 ' + currentFile : ''}`
     : 'Preparing scan...';
+  const findingsEl = $('progressFindings');
+  findingsEl.textContent = typeof findingsCount === 'number'
+    ? `${findingsCount} finding${findingsCount === 1 ? '' : 's'} so far`
+    : '';
+}
+
+// Clears every trace of a previous scan (results, skipped files, filters,
+// and their panels) so starting a new scan doesn't leave stale rows visible
+// underneath the progress bar while the new one runs.
+function resetScanUI() {
+  state.results = [];
+  state.skipped = [];
+  state.sourcePath = '';
+  state.scannedFiles = 0;
+  state.totalFiles = 0;
+  state.expandedRow = null;
+  state.ocrSelected = new Set();
+
+  $('filterKeyword').value = '';
+  $('filterDir').value = '';
+  $('filterFile').value = '';
+  $('filterPanel').style.display = 'none';
+
+  $('resultsPanel').style.display = 'none';
+  $('resultsBody').innerHTML = '';
+  $('emptyState').style.display = 'none';
+
+  $('skippedPanel').style.display = 'none';
+  $('skippedBody').innerHTML = '';
+
+  document.querySelectorAll('.detail-row').forEach(el => el.remove());
+
+  setProgress(0, 0, '', 0);
 }
 
 $('scanBtn').addEventListener('click', async () => {
@@ -66,8 +99,8 @@ $('scanBtn').addEventListener('click', async () => {
   if (!path) { setStatus('Enter or browse to a folder first.', true); return; }
   if (keywords.length === 0) { setStatus('Enter at least one keyword.', true); return; }
 
+  resetScanUI();
   $('scanBtn').disabled = true;
-  setProgress(0, 0, '');
   showProgress(true);
   setStatus('Scanning...');
 
@@ -91,10 +124,11 @@ $('scanBtn').addEventListener('click', async () => {
     }
 
     // The server streams newline-delimited JSON (NDJSON): a 'start' line,
-    // one 'progress' line per file processed, then a final 'done' line
-    // carrying the full result set. This is what powers the live progress bar.
-    const data = await readNdjsonScanResponse(res, (processed, total, currentFile) => {
-      setProgress(processed, total, currentFile);
+    // one 'progress' line per file processed (including a running findings
+    // count), then a final 'done' line carrying the full result set. This is
+    // what powers the live progress bar.
+    const data = await readNdjsonScanResponse(res, (processed, total, currentFile, findingsCount) => {
+      setProgress(processed, total, currentFile, findingsCount);
     });
 
     if (!data) throw new Error('Scan did not complete - no results received');
@@ -145,7 +179,7 @@ async function readNdjsonScanResponse(res, onProgress) {
     for (const line of lines) {
       const msg = parseNdjsonLine(line);
       if (!msg) continue;
-      if (msg.type === 'progress') onProgress(msg.processed, msg.total, msg.currentFile);
+      if (msg.type === 'progress') onProgress(msg.processed, msg.total, msg.currentFile, msg.findingsCount);
       else if (msg.type === 'done') done = msg;
     }
   }
@@ -160,7 +194,7 @@ function parseNdjsonText(text, onProgress) {
   text.split('\n').forEach(line => {
     const msg = parseNdjsonLine(line);
     if (!msg) return;
-    if (msg.type === 'progress') onProgress(msg.processed, msg.total, msg.currentFile);
+    if (msg.type === 'progress') onProgress(msg.processed, msg.total, msg.currentFile, msg.findingsCount);
     else if (msg.type === 'done') done = msg;
   });
   return done;
@@ -200,13 +234,17 @@ function showOcrProgress(visible) {
   $('ocrProgressPanel').style.display = visible ? 'block' : 'none';
 }
 
-function setOcrProgress(processed, total, currentFile) {
+function setOcrProgress(processed, total, currentFile, findingsCount) {
   const pct = total > 0 ? Math.round((processed / total) * 100) : 0;
   $('ocrProgressBarFill').style.width = pct + '%';
   $('ocrProgressPercent').textContent = pct + '%';
   $('ocrProgressLabel').textContent = total > 0
     ? `${processed} of ${total} PDF(s) OCR'd${currentFile ? ' \u2014 ' + currentFile : ''}`
     : 'Preparing OCR...';
+  const findingsEl = $('ocrProgressFindings');
+  findingsEl.textContent = typeof findingsCount === 'number'
+    ? `${findingsCount} finding${findingsCount === 1 ? '' : 's'} so far`
+    : '';
 }
 
 $('ocrBtn').addEventListener('click', async () => {
@@ -224,7 +262,7 @@ $('ocrBtn').addEventListener('click', async () => {
 
   state.ocrRunning = true;
   updateOcrButton();
-  setOcrProgress(0, 0, '');
+  setOcrProgress(0, 0, '', 0);
   showOcrProgress(true);
   setStatus(`Running OCR on ${items.length} PDF(s)...`);
 
@@ -246,8 +284,8 @@ $('ocrBtn').addEventListener('click', async () => {
       throw new Error(data.error || 'OCR failed');
     }
 
-    const data = await readNdjsonScanResponse(res, (processed, total, currentFile) => {
-      setOcrProgress(processed, total, currentFile);
+    const data = await readNdjsonScanResponse(res, (processed, total, currentFile, findingsCount) => {
+      setOcrProgress(processed, total, currentFile, findingsCount);
     });
 
     if (!data) throw new Error('OCR did not complete - no results received');

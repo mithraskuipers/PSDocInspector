@@ -77,6 +77,7 @@
 
   .progress-header { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
   #progressLabel { color: var(--text); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .progress-findings { color: var(--accent); font-family: var(--mono); font-size: 12.5px; flex-shrink: 0; }
   #progressPercent { color: var(--accent); font-family: var(--mono); font-size: 13px; flex-shrink: 0; }
   .progress-track {
     width: 100%;
@@ -163,6 +164,7 @@
   <div class="panel" id="progressPanel" style="display:none;">
     <div class="progress-header">
       <span id="progressLabel">Preparing scan...</span>
+      <span id="progressFindings" class="progress-findings"></span>
       <span id="progressPercent">0%</span>
     </div>
     <div class="progress-track">
@@ -173,6 +175,7 @@
   <div class="panel" id="ocrProgressPanel" style="display:none;">
     <div class="progress-header">
       <span id="ocrProgressLabel">Preparing OCR...</span>
+      <span id="ocrProgressFindings" class="progress-findings"></span>
       <span id="ocrProgressPercent">0%</span>
     </div>
     <div class="progress-track">
