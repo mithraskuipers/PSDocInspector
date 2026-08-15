@@ -415,6 +415,11 @@ function highlightSnippet(text, keyword, searchTerm) {
 let lastFilteredResults = [];
 
 function renderResults() {
+  // Capture this before we wipe the table below, so an in-progress "expand
+  // all" survives a re-render triggered by e.g. the "search within
+  // results" filter changing, instead of silently collapsing.
+  const wasAllExpanded = areAllRowsExpanded();
+
   const filtered = getFilteredResults();
   lastFilteredResults = filtered;
   const snippetTerm = $('filterSnippet').value.trim();
@@ -442,7 +447,11 @@ function renderResults() {
     body.appendChild(tr);
   });
 
-  updateExpandAllLabel();
+  if (wasAllExpanded && filtered.length) {
+    setAllExpanded(true); // re-expands the freshly built rows, updates the label itself
+  } else {
+    updateExpandAllLabel();
+  }
 }
 
 // ---------- Expand / collapse all ----------
