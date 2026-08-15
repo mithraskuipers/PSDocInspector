@@ -8,7 +8,12 @@ let state = {
   ocrSelected: new Set(), // fullPaths of skipped, OCR-eligible PDFs currently checked
   ocrRunning: false,
   ocrAvailable: null, // null = not checked yet, true/false once /api/ocr-status responds
-  ocrUnavailableReason: ''
+  ocrUnavailableReason: '',
+  // The keywords/options that actually produced the current results, saved
+  // at scan time (or restored from an imported file) so exports can record
+  // exactly what was searched for, independent of whatever is currently
+  // sitting in the form fields.
+  searchSettings: { keywords: [], recursive: true, caseSensitive: false, wholeWord: false, useRegex: false }
 };
 
 const $ = (id) => document.getElementById(id);
@@ -74,6 +79,7 @@ function resetScanUI() {
   state.totalFiles = 0;
   state.expandedRow = null;
   state.ocrSelected = new Set();
+  state.searchSettings = { keywords: [], recursive: true, caseSensitive: false, wholeWord: false, useRegex: false };
 
   $('filterKeyword').value = '';
   $('filterDir').value = '';
@@ -99,7 +105,13 @@ $('scanBtn').addEventListener('click', async () => {
   if (!path) { setStatus('Enter or browse to a folder first.', true); return; }
   if (keywords.length === 0) { setStatus('Enter at least one keyword.', true); return; }
 
+  const recursive = $('recursive').checked;
+  const caseSensitive = $('caseSensitive').checked;
+  const wholeWord = $('wholeWord').checked;
+  const useRegex = $('useRegex').checked;
+
   resetScanUI();
+  state.searchSettings = { keywords, recursive, caseSensitive, wholeWord, useRegex };
   $('scanBtn').disabled = true;
   showProgress(true);
   setStatus('Scanning...');
@@ -108,14 +120,7 @@ $('scanBtn').addEventListener('click', async () => {
     const res = await fetch('/api/scan', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        path,
-        recursive: $('recursive').checked,
-        keywords,
-        caseSensitive: $('caseSensitive').checked,
-        wholeWord: $('wholeWord').checked,
-        useRegex: $('useRegex').checked
-      })
+      body: JSON.stringify({ path, recursive, keywords, caseSensitive, wholeWord, useRegex })
     });
 
     if (!res.ok) {
@@ -674,6 +679,7 @@ $('exportJson').addEventListener('click', () => {
     sourcePath: state.sourcePath,
     scannedFiles: state.scannedFiles,
     totalFiles: state.totalFiles,
+    searchSettings: state.searchSettings,
     results: state.results,
     skippedFiles: state.skipped
   };
@@ -682,8 +688,14 @@ $('exportJson').addEventListener('click', () => {
 
 $('exportTxt').addEventListener('click', () => {
   const lines = [];
+  const s = state.searchSettings || {};
   lines.push(`DocInspector Results - Exported ${new Date().toISOString()}`);
   lines.push(`Source: ${state.sourcePath}`);
+  lines.push(`Keywords: ${(s.keywords || []).join(', ')}`);
+  lines.push(`Recursive: ${s.recursive ? 'yes' : 'no'}`);
+  lines.push(`Case sensitive: ${s.caseSensitive ? 'yes' : 'no'}`);
+  lines.push(`Whole word: ${s.wholeWord ? 'yes' : 'no'}`);
+  lines.push(`Regex: ${s.useRegex ? 'yes' : 'no'}`);
   lines.push('================================');
   lines.push('');
   state.results.forEach(r => {
@@ -730,7 +742,19 @@ $('importFile').addEventListener('change', async (e) => {
     state.sourcePath = parsed.sourcePath || '';
     state.scannedFiles = parsed.scannedFiles || 0;
     state.totalFiles = parsed.totalFiles || 0;
+    state.searchSettings = parsed.searchSettings || { keywords: [], recursive: true, caseSensitive: false, wholeWord: false, useRegex: false };
     state.ocrSelected = new Set(state.skipped.filter(isOcrCandidate).map(s => s.fullPath));
+
+    // Reflect the imported search back into the form so it's visible and
+    // ready to re-run, rather than leaving stale/unrelated field values.
+    const s = state.searchSettings;
+    if (state.sourcePath) $('folderPath').value = state.sourcePath;
+    $('keywords').value = (s.keywords || []).join('\n');
+    $('recursive').checked = !!s.recursive;
+    $('caseSensitive').checked = !!s.caseSensitive;
+    $('wholeWord').checked = !!s.wholeWord;
+    $('useRegex').checked = !!s.useRegex;
+
     populateFilterOptions();
     renderResults();
     renderSkipped();
@@ -753,14 +777,22 @@ function parseImportedContent(text) {
       skipped: parsed.skippedFiles || [],
       sourcePath: parsed.sourcePath,
       scannedFiles: parsed.scannedFiles,
-      totalFiles: parsed.totalFiles
+      totalFiles: parsed.totalFiles,
+      searchSettings: parsed.searchSettings
     };
   }
   const [resultsSection, skippedSection] = text.split('SKIPPED FILES - REQUIRE MANUAL INSPECTION');
   return {
     results: parseTxtExport(resultsSection),
     skipped: skippedSection ? parseTxtSkipped(skippedSection) : [],
-    sourcePath: extractTxtField(text, 'Source')
+    sourcePath: extractTxtField(text, 'Source'),
+    searchSettings: {
+      keywords: extractTxtField(text, 'Keywords').split(',').map(k => k.trim()).filter(Boolean),
+      recursive: extractTxtField(text, 'Recursive').toLowerCase() === 'yes',
+      caseSensitive: extractTxtField(text, 'Case sensitive').toLowerCase() === 'yes',
+      wholeWord: extractTxtField(text, 'Whole word').toLowerCase() === 'yes',
+      useRegex: extractTxtField(text, 'Regex').toLowerCase() === 'yes'
+    }
   };
 }
 
