@@ -413,13 +413,15 @@ function highlightSnippet(text, keyword, searchTerm) {
 }
 
 let lastFilteredResults = [];
+// Explicit "expand all" intent, set only via the Expand all/Collapse all
+// button. Deliberately NOT inferred from the live DOM before each render:
+// when a filter (e.g. "search within results") temporarily narrows the
+// results to zero rows, there's nothing left in the DOM to introspect, so
+// a DOM-based check would silently forget that expand-all was active and
+// fail to restore it once matching rows come back.
+let expandAllIntent = false;
 
 function renderResults() {
-  // Capture this before we wipe the table below, so an in-progress "expand
-  // all" survives a re-render triggered by e.g. the "search within
-  // results" filter changing, instead of silently collapsing.
-  const wasAllExpanded = areAllRowsExpanded();
-
   const filtered = getFilteredResults();
   lastFilteredResults = filtered;
   const snippetTerm = $('filterSnippet').value.trim();
@@ -447,7 +449,7 @@ function renderResults() {
     body.appendChild(tr);
   });
 
-  if (wasAllExpanded && filtered.length) {
+  if (expandAllIntent && filtered.length) {
     setAllExpanded(true); // re-expands the freshly built rows, updates the label itself
   } else {
     updateExpandAllLabel();
@@ -470,6 +472,7 @@ function updateExpandAllLabel() {
 }
 
 function setAllExpanded(expand) {
+  expandAllIntent = expand; // remember the user's explicit choice, independent of DOM state
   const term = $('filterSnippet').value.trim();
   const rows = document.querySelectorAll('#resultsBody > tr:not(.detail-row)');
   rows.forEach((tr, i) => {
