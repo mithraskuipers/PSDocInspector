@@ -270,6 +270,11 @@ function Get-DocText {
             $script:WordApp.Visible = $false
         } catch {
             $script:WordFailed = $true
+            # Keep the actual COM error around separately from the
+            # 'unavailable' sentinel so the caller can surface the real
+            # reason (e.g. a registration/permission problem) instead of
+            # always claiming Word isn't installed when it actually is.
+            $script:WordUnavailableReason = $_.Exception.Message
             $script:LastDocOpenError = 'unavailable'
             return $null
         }
@@ -647,6 +652,30 @@ function Send-StaticFile {
     $Context.Response.OutputStream.Close()
 }
 
+function Invoke-OpenFileRequest {
+    <#
+        Opens a scanned file in its default associated application (Word,
+        Excel, Adobe Reader, etc.) via the OS, triggered by the user clicking
+        a filename in the results table. Runs server-side because the
+        browser itself has no way to launch a native app for a local path.
+    #>
+    param($Context)
+    $req = (Get-RequestBody -Context $Context) | ConvertFrom-Json
+    $fullPath = $req.fullPath
+
+    if ([string]::IsNullOrWhiteSpace($fullPath) -or -not (Test-Path -LiteralPath $fullPath -PathType Leaf)) {
+        Send-Json -Context $Context -StatusCode 404 -Data @{ error = "File not found: $fullPath" }
+        return
+    }
+
+    try {
+        Start-Process -FilePath $fullPath | Out-Null
+        Send-Json -Context $Context -Data @{ success = $true }
+    } catch {
+        Send-Json -Context $Context -StatusCode 500 -Data @{ error = "Could not open file: $($_.Exception.Message)" }
+    }
+}
+
 function Show-FolderBrowserDialog {
     $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
     $rs.ApartmentState = [System.Threading.ApartmentState]::STA
@@ -793,6 +822,12 @@ function Invoke-ScanRequest {
                         # instead of always blaming a missing Word install.
                         if ($script:LastDocOpenError -and $script:LastDocOpenError -ne 'unavailable') {
                             "Word could not open this file: $($script:LastDocOpenError)"
+                        } elseif ($script:WordUnavailableReason) {
+                            # Word is installed enough to be found on the
+                            # system, but PowerShell couldn't instantiate it
+                            # via COM - report the real error instead of a
+                            # blanket "not installed" message.
+                            "Microsoft Word could not be started - $($script:WordUnavailableReason)"
                         } else {
                             'Microsoft Word is not available on this machine - legacy .doc files require Word to be installed'
                         }
@@ -998,6 +1033,10 @@ function Handle-Request {
         }
         '^/api/ocr$' {
             if ($method -eq 'POST') { Invoke-OcrRequest -Context $Context }
+            else { $Context.Response.StatusCode = 405; $Context.Response.OutputStream.Close() }
+        }
+        '^/api/open-file$' {
+            if ($method -eq 'POST') { Invoke-OpenFileRequest -Context $Context }
             else { $Context.Response.StatusCode = 405; $Context.Response.OutputStream.Close() }
         }
         default {

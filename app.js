@@ -371,14 +371,37 @@ function renderResults() {
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td class="keyword">${escapeHtml(r.keyword)}</td>
-      <td>${escapeHtml(r.fileName)}${r.viaOcr ? ' <span class="badge viaocr">via OCR</span>' : ''}</td>
+      <td><span class="filename-link" title="Open ${escapeHtml(r.fullPath)}">${escapeHtml(r.fileName)}</span>${r.viaOcr ? ' <span class="badge viaocr">via OCR</span>' : ''}</td>
       <td>${escapeHtml(r.extension)}</td>
       <td class="count">${r.count}</td>
       <td class="dir" title="${escapeHtml(r.fullPath)}">${escapeHtml(r.directory)}</td>
     `;
     tr.addEventListener('click', () => toggleDetail(tr, r, idx));
+    const link = tr.querySelector('.filename-link');
+    link.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openFile(r.fullPath);
+    });
     body.appendChild(tr);
   });
+}
+
+// Opens a result's original file in its default application via the server
+// (the browser has no way to launch a native app for a local path itself).
+async function openFile(fullPath) {
+  setStatus(`Opening ${fullPath}...`);
+  try {
+    const res = await fetch('/api/open-file', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fullPath })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'Could not open file');
+    setStatus('');
+  } catch (e) {
+    setStatus('Could not open file: ' + e.message, true);
+  }
 }
 
 // A skipped PDF is a candidate for OCR if the server flagged it as
