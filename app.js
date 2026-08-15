@@ -338,7 +338,7 @@ function getFilteredResults() {
     if (kw && r.keyword.toLowerCase() !== kw) return false;
     if (dir && !(r.directory || '').toLowerCase().includes(dir)) return false;
     if (file && !(r.fileName || '').toLowerCase().includes(file)) return false;
-    if (snippet && !(r.snippets || []).some(s => s.toLowerCase().includes(snippet))) return false;
+    if (snippet && !toSnippetArray(r.snippets).some(s => s.toLowerCase().includes(snippet))) return false;
     return true;
   });
 }
@@ -364,6 +364,17 @@ function escapeHtml(s) {
 
 function escapeRegExp(s) {
   return String(s ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Normalizes a result's `snippets` field to an array. Needed because
+// PowerShell's ConvertTo-Json collapses a single-item pipeline result to a
+// bare scalar instead of a 1-element array, so a result with exactly one
+// match can come back (or be re-imported from a previously-exported file)
+// as a plain string rather than an array of one string.
+function toSnippetArray(snippets) {
+  if (Array.isArray(snippets)) return snippets;
+  if (snippets) return [snippets];
+  return [];
 }
 
 // Builds non-overlapping highlight ranges for one or more search terms
@@ -620,7 +631,7 @@ function buildDetailRow(r, snippetTerm) {
   // When "search within results" is active, only show snippets that
   // actually match it (still highlighted), rather than all of them.
   const term = (snippetTerm || '').trim();
-  const allSnippets = r.snippets || [];
+  const allSnippets = toSnippetArray(r.snippets);
   const matching = term
     ? allSnippets.filter(s => s.toLowerCase().includes(term.toLowerCase()))
     : allSnippets;
@@ -682,7 +693,7 @@ $('exportTxt').addEventListener('click', () => {
     lines.push(`Count: ${r.count}`);
     if (r.viaOcr) lines.push('Via OCR: yes');
     lines.push('Snippets:');
-    (r.snippets || []).forEach(s => lines.push(`  - ${s}`));
+    toSnippetArray(r.snippets).forEach(s => lines.push(`  - ${s}`));
     lines.push('');
   });
 

@@ -869,7 +869,12 @@ function Invoke-ScanRequest {
                         fullPath  = $file.FullName
                         extension = $ext
                         count     = $snippets.Count
-                        snippets  = $snippets | Select-Object -First 5
+                        # Wrapped in @() so a single match still serializes as
+                        # a 1-element JSON array (ConvertTo-Json otherwise
+                        # collapses a lone pipeline object to a bare scalar,
+                        # which breaks .map()/.filter() on the client, most
+                        # visibly when re-importing an exported JSON file).
+                        snippets  = @($snippets | Select-Object -First 5)
                     }
                 }
             }
@@ -980,7 +985,12 @@ function Invoke-OcrRequest {
                         fullPath  = $fullPath
                         extension = $item.extension
                         count     = $snippets.Count
-                        snippets  = $snippets | Select-Object -First 5
+                        # Wrapped in @() so a single match still serializes as
+                        # a 1-element JSON array (ConvertTo-Json otherwise
+                        # collapses a lone pipeline object to a bare scalar,
+                        # which breaks .map()/.filter() on the client, most
+                        # visibly when re-importing an exported JSON file).
+                        snippets  = @($snippets | Select-Object -First 5)
                         viaOcr    = $true
                     }
                 }
