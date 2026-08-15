@@ -115,6 +115,7 @@
   .snippet { font-family: var(--mono); font-size: 12px; color: var(--muted); padding: 3px 0; }
   .snippet b { color: var(--text); }
   .snippet mark { background: var(--accent-dim); color: var(--text); padding: 0 2px; border-radius: 2px; }
+  .snippet mark.kw-match { background: none; color: var(--danger); padding: 0; font-weight: 600; }
   .full-path { font-family: var(--mono); font-size: 12px; color: var(--text); margin-bottom: 8px; word-break: break-all; }
 
   .results-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; flex-wrap: wrap; gap: 10px; }
@@ -206,6 +207,7 @@
     <div class="results-header">
       <div class="count" id="resultsCount"></div>
       <div class="row">
+        <button class="secondary" id="expandAllBtn">Expand all</button>
         <button class="secondary" id="exportJson">Download JSON</button>
         <button class="secondary" id="exportTxt">Download TXT</button>
       </div>

@@ -366,18 +366,57 @@ function escapeRegExp(s) {
   return String(s ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-// Wraps case-insensitive matches of `term` in <mark> within already-escaped
-// HTML, so the "search within results" filter is visible right in the
-// snippet text when a row is expanded.
-function highlightTerm(escapedHtml, term) {
-  if (!term) return escapedHtml;
-  const escapedTerm = escapeHtml(term);
-  const re = new RegExp(escapeRegExp(escapedTerm), 'gi');
-  return escapedHtml.replace(re, m => `<mark>${m}</mark>`);
+// Builds non-overlapping highlight ranges for one or more search terms
+// against raw (unescaped) snippet text. Earlier entries in `patterns` win
+// when two terms overlap in the same spot.
+function buildHighlightRanges(text, patterns) {
+  const ranges = [];
+  patterns.forEach(p => {
+    if (!p.term) return;
+    const re = new RegExp(escapeRegExp(p.term), 'gi');
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      ranges.push({ start: m.index, end: m.index + m[0].length, cls: p.cls });
+      if (m[0].length === 0) re.lastIndex++;
+    }
+  });
+  ranges.sort((a, b) => a.start - b.start || (b.end - b.start) - (a.end - a.start));
+  const resolved = [];
+  let lastEnd = -1;
+  ranges.forEach(r => {
+    if (r.start >= lastEnd) {
+      resolved.push(r);
+      lastEnd = r.end;
+    }
+  });
+  return resolved;
 }
+
+// Renders a snippet with the matched keyword highlighted in red, and (if a
+// "search within results" term is active) that term highlighted separately.
+function highlightSnippet(text, keyword, searchTerm) {
+  const raw = String(text ?? '');
+  const ranges = buildHighlightRanges(raw, [
+    { term: keyword, cls: 'kw-match' },
+    { term: searchTerm, cls: 'term-match' }
+  ]);
+  if (!ranges.length) return escapeHtml(raw);
+  let out = '';
+  let pos = 0;
+  ranges.forEach(r => {
+    out += escapeHtml(raw.slice(pos, r.start));
+    out += `<mark class="${r.cls}">${escapeHtml(raw.slice(r.start, r.end))}</mark>`;
+    pos = r.end;
+  });
+  out += escapeHtml(raw.slice(pos));
+  return out;
+}
+
+let lastFilteredResults = [];
 
 function renderResults() {
   const filtered = getFilteredResults();
+  lastFilteredResults = filtered;
   const snippetTerm = $('filterSnippet').value.trim();
   const body = $('resultsBody');
   body.innerHTML = '';
@@ -385,7 +424,7 @@ function renderResults() {
   $('resultsCount').textContent = `${filtered.length} of ${state.results.length} row(s)`;
   $('emptyState').style.display = filtered.length ? 'none' : 'block';
 
-  filtered.forEach((r, idx) => {
+  filtered.forEach((r) => {
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td class="keyword">${escapeHtml(r.keyword)}</td>
@@ -394,7 +433,7 @@ function renderResults() {
       <td class="count">${r.count}</td>
       <td class="dir" title="${escapeHtml(r.fullPath)}">${escapeHtml(r.directory)}</td>
     `;
-    tr.addEventListener('click', () => toggleDetail(tr, r, idx, snippetTerm));
+    tr.addEventListener('click', () => toggleDetail(tr, r, snippetTerm));
     const link = tr.querySelector('.filename-link');
     link.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -402,7 +441,41 @@ function renderResults() {
     });
     body.appendChild(tr);
   });
+
+  updateExpandAllLabel();
 }
+
+// ---------- Expand / collapse all ----------
+
+function areAllRowsExpanded() {
+  const rows = document.querySelectorAll('#resultsBody > tr:not(.detail-row)');
+  return rows.length > 0 && [...rows].every(tr => tr.nextElementSibling && tr.nextElementSibling.classList.contains('detail-row'));
+}
+
+function updateExpandAllLabel() {
+  const btn = $('expandAllBtn');
+  if (!btn) return;
+  const rows = document.querySelectorAll('#resultsBody > tr:not(.detail-row)');
+  btn.disabled = rows.length === 0;
+  btn.textContent = areAllRowsExpanded() ? 'Collapse all' : 'Expand all';
+}
+
+function setAllExpanded(expand) {
+  const term = $('filterSnippet').value.trim();
+  const rows = document.querySelectorAll('#resultsBody > tr:not(.detail-row)');
+  rows.forEach((tr, i) => {
+    const existing = tr.nextElementSibling;
+    const hasDetail = existing && existing.classList.contains('detail-row');
+    if (expand && !hasDetail) {
+      tr.after(buildDetailRow(lastFilteredResults[i], term));
+    } else if (!expand && hasDetail) {
+      existing.remove();
+    }
+  });
+  updateExpandAllLabel();
+}
+
+$('expandAllBtn').addEventListener('click', () => setAllExpanded(!areAllRowsExpanded()));
 
 // Opens a result's original file in its default application via the server
 // (the browser has no way to launch a native app for a local path itself).
@@ -529,14 +602,7 @@ $('ocrSelectAll').addEventListener('change', () => {
   renderSkipped();
 });
 
-function toggleDetail(tr, r, idx, snippetTerm) {
-  const existing = tr.nextElementSibling;
-  if (existing && existing.classList.contains('detail-row')) {
-    existing.remove();
-    return;
-  }
-  document.querySelectorAll('.detail-row').forEach(el => el.remove());
-
+function buildDetailRow(r, snippetTerm) {
   const detail = document.createElement('tr');
   detail.className = 'detail-row';
   // When "search within results" is active, only show snippets that
@@ -546,7 +612,7 @@ function toggleDetail(tr, r, idx, snippetTerm) {
   const matching = term
     ? allSnippets.filter(s => s.toLowerCase().includes(term.toLowerCase()))
     : allSnippets;
-  const snippets = matching.map(s => `<div class="snippet">${highlightTerm(escapeHtml(s), term)}</div>`).join('');
+  const snippets = matching.map(s => `<div class="snippet">${highlightSnippet(s, r.keyword, term)}</div>`).join('');
   const noneMsg = term ? 'No snippet matches your search within results' : 'No snippet available';
   detail.innerHTML = `
     <td colspan="5">
@@ -554,7 +620,17 @@ function toggleDetail(tr, r, idx, snippetTerm) {
       ${snippets || `<div class="snippet">${noneMsg}</div>`}
     </td>
   `;
-  tr.after(detail);
+  return detail;
+}
+
+function toggleDetail(tr, r, snippetTerm) {
+  const existing = tr.nextElementSibling;
+  if (existing && existing.classList.contains('detail-row')) {
+    existing.remove();
+  } else {
+    tr.after(buildDetailRow(r, snippetTerm));
+  }
+  updateExpandAllLabel();
 }
 
 // ---------- Export ----------
