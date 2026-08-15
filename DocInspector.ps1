@@ -44,15 +44,233 @@ function Get-XlsxText {
     } finally { $zip.Dispose() }
 }
 
-function Get-DocText {
+function Test-IsOleCompoundFile {
+    <#
+        Genuine binary .doc files are OLE Compound File Binary documents,
+        which always start with the fixed 8-byte signature below. .doc files
+        exported by systems like Confluence are actually HTML or MHTML text
+        saved with a .doc extension, so they will never match this signature.
+        Used to route .doc files to the correct extractor based on real
+        content rather than trusting the extension. Fails safe (returns
+        $false) on any read error so callers fall through to the HTML/MHTML
+        path, which itself fails gracefully on genuinely unreadable content.
+    #>
     param($Path)
-    if ($script:WordFailed) { return $null }
+    try {
+        $sig = [byte[]]@(0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1)
+        $buffer = New-Object byte[] 8
+        $fs = [System.IO.File]::OpenRead($Path)
+        try {
+            $read = $fs.Read($buffer, 0, 8)
+        } finally {
+            $fs.Close()
+        }
+        if ($read -lt 8) { return $false }
+        for ($i = 0; $i -lt 8; $i++) {
+            if ($buffer[$i] -ne $sig[$i]) { return $false }
+        }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function ConvertFrom-QuotedPrintableBytes {
+    <#
+        Decodes a quoted-printable MIME body (as read via a 1-byte-per-char
+        Latin-1/ISO-8859-1 string, so character offsets line up with raw file
+        bytes) into the original byte array: "=XX" hex escapes become single
+        bytes and soft line breaks ("=" followed by a line break) are removed.
+        The caller re-decodes the resulting bytes using the part's declared
+        charset, since quoted-printable text is charset-agnostic at this stage.
+    #>
+    param([string]$Text)
+    $joined = $Text -replace '=\r?\n', ''
+    $bytes = New-Object System.Collections.Generic.List[byte]
+    $chars = $joined.ToCharArray()
+    $i = 0
+    while ($i -lt $chars.Length) {
+        if ($chars[$i] -eq '=' -and ($i + 2) -lt $chars.Length -and
+            $chars[($i + 1)] -match '[0-9A-Fa-f]' -and $chars[($i + 2)] -match '[0-9A-Fa-f]') {
+            $hex = "$($chars[$i + 1])$($chars[$i + 2])"
+            $bytes.Add([byte][Convert]::ToInt32($hex, 16))
+            $i += 3
+        } else {
+            $bytes.Add([byte]$chars[$i])
+            $i++
+        }
+    }
+    return $bytes.ToArray()
+}
+
+function Get-EncodingByName {
+    param([string]$Name)
+    try {
+        return [System.Text.Encoding]::GetEncoding($Name.Trim())
+    } catch {
+        return [System.Text.Encoding]::UTF8
+    }
+}
+
+function ConvertTo-PlainTextFromHtml {
+    <#
+        Strips an HTML/Word-HTML fragment down to its human-readable text,
+        so keyword matching and result previews only ever see what a user
+        would actually read - never tags, attributes, CSS, JavaScript,
+        Office/XML metadata, or MIME artifacts.
+    #>
+    param([string]$Html)
+    if ([string]::IsNullOrEmpty($Html)) { return '' }
+
+    $opts = [System.Text.RegularExpressions.RegexOptions]::Singleline
+    $optsI = $opts -bor [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+
+    # Drop HTML comments first - this also removes Word's conditional
+    # comment blocks (<!--[if gte mso 9]>...<![endif]-->) which commonly
+    # wrap VML shapes and <xml> metadata that isn't visible document text.
+    $t = [regex]::Replace($Html, '<!--.*?-->', ' ', $opts)
+
+    # Drop entire elements whose content is never visible document text.
+    $t = [regex]::Replace($t, '<script\b[^>]*>.*?</script>', ' ', $optsI)
+    $t = [regex]::Replace($t, '<style\b[^>]*>.*?</style>', ' ', $optsI)
+    $t = [regex]::Replace($t, '<xml\b[^>]*>.*?</xml>', ' ', $optsI)
+    $t = [regex]::Replace($t, '<head\b[^>]*>.*?</head>', ' ', $optsI)
+
+    # Turn block/line-break boundaries into newlines before stripping tags,
+    # so words from separate elements don't run together.
+    $t = [regex]::Replace($t, '(?i)<(br|/p|/div|/tr|/li|/h[1-6]|/table)\s*/?>', "`n")
+
+    # Strip every remaining tag, including its attributes.
+    $t = [regex]::Replace($t, '<[^>]+>', ' ')
+
+    # Decode HTML entities (&amp;, &nbsp;, &#8217;, etc.)
+    $t = [System.Net.WebUtility]::HtmlDecode($t)
+
+    # Collapse whitespace produced by the tag stripping above.
+    $t = [regex]::Replace($t, '[ \t]+', ' ')
+    $t = [regex]::Replace($t, '\n[ \t]*', "`n")
+    $t = [regex]::Replace($t, '\n{2,}', "`n")
+    return $t.Trim()
+}
+
+function Get-DocHtmlText {
+    <#
+        Extracts human-readable text from a .doc file that is actually
+        HTML or MHTML content (e.g. exported from Confluence) rather than a
+        genuine binary Word document. Handles both a bare HTML/Word-HTML
+        payload and a full MHTML multipart/related package, decoding
+        quoted-printable/base64 bodies and the declared charset before
+        stripping markup. Returns '' (not $null) on any parse failure so the
+        caller reports "no readable text" instead of a misleading
+        Word-unavailable message, and so a malformed file never crashes
+        the scan.
+    #>
+    param($Path)
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($Path)
+        if ($bytes.Length -eq 0) { return '' }
+        $latin1 = [System.Text.Encoding]::GetEncoding('ISO-8859-1')
+        $raw = $latin1.GetString($bytes)
+
+        # Sanity check: if the content has none of the hallmarks of HTML or
+        # MHTML, this .doc is neither a genuine binary Word document (already
+        # ruled out by the OLE signature check) nor recognizable markup - it's
+        # malformed or unsupported. Bail out cleanly rather than running markup
+        # stripping over arbitrary bytes and reporting garbage as "text".
+        if ($raw -notmatch '(?i)(<html|<body|<w:worddocument|multipart/related|mime-version:)') {
+            return ''
+        }
+
+        $htmlFragment = $null
+
+        if ($raw -match '(?im)^\s*(MIME-Version:|Content-Type:\s*multipart/related)') {
+            $boundaryMatch = [regex]::Match($raw, '(?is)Content-Type:\s*multipart/related;.*?boundary\s*=\s*"?([^";\r\n]+)"?')
+            if ($boundaryMatch.Success) {
+                $boundary = $boundaryMatch.Groups[1].Value.Trim()
+                if ($boundary) {
+                    $splitToken = "--$boundary"
+                    $parts = $raw -split [regex]::Escape($splitToken)
+                    foreach ($part in $parts) {
+                        if ($part -notmatch '(?im)^\s*Content-Type:\s*text/html') { continue }
+
+                        $sep = $part.IndexOf("`r`n`r`n")
+                        if ($sep -lt 0) { $sep = $part.IndexOf("`n`n") }
+                        if ($sep -lt 0) { continue }
+
+                        $headerBlock = $part.Substring(0, $sep)
+                        $bodyBlock = $part.Substring($sep).TrimStart("`r", "`n")
+
+                        $charset = 'UTF-8'
+                        $csMatch = [regex]::Match($headerBlock, '(?i)charset\s*=\s*"?([\w\-]+)"?')
+                        if ($csMatch.Success) { $charset = $csMatch.Groups[1].Value }
+
+                        if ($headerBlock -match '(?im)^\s*Content-Transfer-Encoding:\s*quoted-printable') {
+                            $bodyBytes = ConvertFrom-QuotedPrintableBytes -Text $bodyBlock
+                        } elseif ($headerBlock -match '(?im)^\s*Content-Transfer-Encoding:\s*base64') {
+                            try {
+                                $bodyBytes = [Convert]::FromBase64String(($bodyBlock -replace '\s', ''))
+                            } catch {
+                                $bodyBytes = $latin1.GetBytes($bodyBlock)
+                            }
+                        } else {
+                            $bodyBytes = $latin1.GetBytes($bodyBlock)
+                        }
+
+                        $enc = Get-EncodingByName -Name $charset
+                        $htmlFragment = $enc.GetString($bodyBytes)
+                        break
+                    }
+                }
+            }
+            if (-not $htmlFragment) {
+                # Couldn't isolate the text/html MIME part (unexpected
+                # boundary format, etc.) - fall back to the whole payload so
+                # markup stripping still has a chance to recover the text
+                # rather than reporting zero content outright.
+                $htmlFragment = $raw
+            }
+        } else {
+            # Not MHTML - treat as a bare HTML/Word-HTML document saved with
+            # a .doc extension. Respect a declared <meta charset> if present.
+            $charset = 'UTF-8'
+            $csMatch = [regex]::Match($raw, '(?i)<meta[^>]+charset\s*=\s*"?([\w\-]+)')
+            if ($csMatch.Success) { $charset = $csMatch.Groups[1].Value }
+            $enc = Get-EncodingByName -Name $charset
+            $htmlFragment = $enc.GetString($bytes)
+        }
+
+        return ConvertTo-PlainTextFromHtml -Html $htmlFragment
+    } catch {
+        return ''
+    }
+}
+
+function Get-DocText {
+    <#
+        Extracts text from a genuine binary .doc via the Word COM object.
+        Returns $null on any failure. $script:LastDocOpenError distinguishes
+        *why* for the caller: 'unavailable' means Word itself couldn't be
+        launched (not installed/licensed), while any other value is the
+        actual exception message from Documents.Open() - i.e. Word is fine,
+        but this specific file could not be opened (locked, corrupted,
+        Protected View, password-protected, etc). Get-FileText uses this to
+        avoid reporting a misleading "Word is not available" reason when
+        Word is actually working.
+    #>
+    param($Path)
+    $script:LastDocOpenError = $null
+
+    if ($script:WordFailed) {
+        $script:LastDocOpenError = 'unavailable'
+        return $null
+    }
     if (-not $script:WordApp) {
         try {
             $script:WordApp = New-Object -ComObject Word.Application
             $script:WordApp.Visible = $false
         } catch {
             $script:WordFailed = $true
+            $script:LastDocOpenError = 'unavailable'
             return $null
         }
     }
@@ -61,7 +279,10 @@ function Get-DocText {
         $text = $doc.Content.Text
         $doc.Close($false)
         return $text
-    } catch { return $null }
+    } catch {
+        $script:LastDocOpenError = $_.Exception.Message
+        return $null
+    }
 }
 
 function Get-XlsText {
@@ -307,7 +528,33 @@ function Get-FileText {
     switch ($Extension) {
         '.docx' { return Get-DocxText -Path $Path }
         '.xlsx' { return Get-XlsxText -Path $Path }
-        '.doc'  { return Get-DocText -Path $Path }
+        '.doc'  {
+            # Not every .doc file is a binary Word document - systems like
+            # Confluence export .doc files that are actually HTML or MHTML.
+            # Detect the real format from content, not the extension.
+            if (Test-IsOleCompoundFile -Path $Path) {
+                $text = Get-DocText -Path $Path
+                if ($null -ne $text) { return $text }
+
+                # Word couldn't produce text for this file - either it isn't
+                # actually available, or it choked on this specific file even
+                # though it opened fine for others. Either way, try the
+                # HTML/MHTML extractor as a fallback: it needs no Word
+                # dependency at all, so it costs nothing to attempt, and it
+                # recovers files that merely *look* like binary docs (e.g. an
+                # OLE-wrapped file with embedded HTML) or where Word's own
+                # open attempt failed for an unrelated reason.
+                $htmlText = Get-DocHtmlText -Path $Path
+                if (-not [string]::IsNullOrWhiteSpace($htmlText)) { return $htmlText }
+
+                # Neither path produced anything - return $null so the
+                # existing "Word not available" / open-error reporting in
+                # Invoke-ScanRequest still applies below.
+                return $null
+            } else {
+                return Get-DocHtmlText -Path $Path
+            }
+        }
         '.xls'  { return Get-XlsText -Path $Path }
         '.pdf'  { return Get-PdfText -Path $Path }
         '.rtf'  { return Get-RtfText -Path $Path }
@@ -535,7 +782,21 @@ function Invoke-ScanRequest {
         if (-not $reason) {
             if ($null -eq $text) {
                 $reason = switch ($ext) {
-                    '.doc'  { 'Microsoft Word is not available on this machine - legacy .doc files require Word to be installed' }
+                    '.doc'  {
+                        # Get-FileText already tried the HTML/MHTML fallback
+                        # for .doc before giving up, so a $null here means a
+                        # genuine binary .doc that Word could not produce
+                        # text for. $script:LastDocOpenError (set by
+                        # Get-DocText) tells us whether that's because Word
+                        # itself is unavailable or because Word choked on
+                        # this specific file - report the real reason
+                        # instead of always blaming a missing Word install.
+                        if ($script:LastDocOpenError -and $script:LastDocOpenError -ne 'unavailable') {
+                            "Word could not open this file: $($script:LastDocOpenError)"
+                        } else {
+                            'Microsoft Word is not available on this machine - legacy .doc files require Word to be installed'
+                        }
+                    }
                     '.xls'  { 'Microsoft Excel is not available on this machine - legacy .xls files require Excel to be installed' }
                     '.pdf'  { 'Could not extract text - the PDF may be encrypted, corrupted, or use an unsupported structure' }
                     '.rtf'  { 'Could not read RTF content' }
@@ -745,6 +1006,13 @@ function Handle-Request {
 }
 
 # ---------- Main ----------
+
+# Guard the listener startup so this script can be dot-sourced (e.g. by
+# Pester tests exercising the extraction/matching functions above) without
+# actually opening a port and launching a browser. Normal usage
+# (".\DocInspector.ps1") is unaffected - $MyInvocation.InvocationName is only
+# '.' when the script is dot-sourced.
+if ($MyInvocation.InvocationName -eq '.') { return }
 
 $listener = New-Object System.Net.HttpListener
 $prefix = "http://localhost:$Port/"
