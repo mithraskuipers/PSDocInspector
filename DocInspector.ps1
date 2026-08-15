@@ -916,6 +916,9 @@ function Invoke-ScanRequest {
     $skipped = @()
     $scanned = 0
     $processed = 0
+    $sentResultsCount = 0
+    $sentSkippedCount = 0
+    $lastPartialSent = Get-Date
 
     foreach ($file in $files) {
         $ext = $file.Extension.ToLower()
@@ -1012,8 +1015,33 @@ function Invoke-ScanRequest {
             processed     = $processed
             total         = $files.Count
             scanned       = $scanned
+            skipped       = $skipped.Count
             currentFile   = $file.Name
             findingsCount = $results.Count
+        }
+
+        # Throttle full-row streaming to roughly every 2 seconds (rather than
+        # every file) so a half-hour scan doesn't spend most of its time
+        # serializing JSON - but still lets the person start reviewing real
+        # findings and skipped-file reasons well before the scan finishes,
+        # instead of staring at a bare progress bar the whole time. Only the
+        # rows added since the last partial are sent; the client appends them.
+        if (((Get-Date) - $lastPartialSent) -ge [TimeSpan]::FromSeconds(2) -or $processed -eq $files.Count) {
+            if ($results.Count -gt $sentResultsCount -or $skipped.Count -gt $sentSkippedCount) {
+                $newResults = if ($results.Count -gt $sentResultsCount) { @($results[$sentResultsCount..($results.Count - 1)]) } else { @() }
+                $newSkipped = if ($skipped.Count -gt $sentSkippedCount) { @($skipped[$sentSkippedCount..($skipped.Count - 1)]) } else { @() }
+                Write-NdjsonLine -Stream $stream -Data @{
+                    type         = 'partial'
+                    newResults   = $newResults
+                    newSkipped   = $newSkipped
+                    scannedFiles = $scanned
+                    skippedCount = $skipped.Count
+                    processed    = $processed
+                }
+                $sentResultsCount = $results.Count
+                $sentSkippedCount = $skipped.Count
+            }
+            $lastPartialSent = Get-Date
         }
     }
 
@@ -1068,6 +1096,9 @@ function Invoke-OcrRequest {
     $recoveredPaths = @()
     $scanned = 0
     $processed = 0
+    $sentResultsCount = 0
+    $sentSkippedCount = 0
+    $lastPartialSent = Get-Date
 
     foreach ($item in $items) {
         $fullPath = $item.fullPath
@@ -1129,8 +1160,27 @@ function Invoke-OcrRequest {
             processed     = $processed
             total         = $items.Count
             scanned       = $scanned
+            skipped       = $stillSkipped.Count
             currentFile   = $item.fileName
             findingsCount = $results.Count
+        }
+
+        if (((Get-Date) - $lastPartialSent) -ge [TimeSpan]::FromSeconds(2) -or $processed -eq $items.Count) {
+            if ($results.Count -gt $sentResultsCount -or $stillSkipped.Count -gt $sentSkippedCount) {
+                $newResults = if ($results.Count -gt $sentResultsCount) { @($results[$sentResultsCount..($results.Count - 1)]) } else { @() }
+                $newSkipped = if ($stillSkipped.Count -gt $sentSkippedCount) { @($stillSkipped[$sentSkippedCount..($stillSkipped.Count - 1)]) } else { @() }
+                Write-NdjsonLine -Stream $stream -Data @{
+                    type         = 'partial'
+                    newResults   = $newResults
+                    newSkipped   = $newSkipped
+                    scannedFiles = $scanned
+                    skippedCount = $stillSkipped.Count
+                    processed    = $processed
+                }
+                $sentResultsCount = $results.Count
+                $sentSkippedCount = $stillSkipped.Count
+            }
+            $lastPartialSent = Get-Date
         }
     }
 

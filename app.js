@@ -55,7 +55,7 @@ function showProgress(visible) {
   $('progressPanel').style.display = visible ? 'block' : 'none';
 }
 
-function setProgress(processed, total, currentFile, findingsCount) {
+function setProgress(processed, total, currentFile, findingsCount, skippedCount) {
   const pct = total > 0 ? Math.round((processed / total) * 100) : 0;
   $('progressBarFill').style.width = pct + '%';
   $('progressPercent').textContent = pct + '%';
@@ -65,6 +65,10 @@ function setProgress(processed, total, currentFile, findingsCount) {
   const findingsEl = $('progressFindings');
   findingsEl.textContent = typeof findingsCount === 'number'
     ? `${findingsCount} finding${findingsCount === 1 ? '' : 's'} so far`
+    : '';
+  const skippedEl = $('progressSkipped');
+  skippedEl.textContent = typeof skippedCount === 'number' && skippedCount > 0
+    ? `${skippedCount} skipped/failed`
     : '';
 }
 
@@ -95,7 +99,7 @@ function resetScanUI() {
 
   document.querySelectorAll('.detail-row').forEach(el => el.remove());
 
-  setProgress(0, 0, '', 0);
+  setProgress(0, 0, '', 0, 0);
 }
 
 $('scanBtn').addEventListener('click', async () => {
@@ -129,15 +133,31 @@ $('scanBtn').addEventListener('click', async () => {
     }
 
     // The server streams newline-delimited JSON (NDJSON): a 'start' line,
-    // one 'progress' line per file processed (including a running findings
-    // count), then a final 'done' line carrying the full result set. This is
-    // what powers the live progress bar.
-    const data = await readNdjsonScanResponse(res, (processed, total, currentFile, findingsCount) => {
-      setProgress(processed, total, currentFile, findingsCount);
-    });
+    // one 'progress' line per file processed (including running findings and
+    // skipped counts), periodic 'partial' lines carrying newly-found rows
+    // (so results/skipped files show up live instead of only at the end -
+    // useful since a full scan can take a while), and a final 'done' line
+    // carrying the authoritative full result set.
+    const data = await readNdjsonScanResponse(
+      res,
+      (processed, total, currentFile, findingsCount, skippedCount) => {
+        setProgress(processed, total, currentFile, findingsCount, skippedCount);
+      },
+      (newResults, newSkipped) => {
+        if (newResults.length) state.results.push(...newResults);
+        if (newSkipped.length) state.skipped.push(...newSkipped);
+        if (newResults.length || newSkipped.length) {
+          populateFilterOptions();
+          renderResults();
+          renderSkipped();
+        }
+      }
+    );
 
     if (!data) throw new Error('Scan did not complete - no results received');
 
+    // 'done' carries the authoritative full arrays - replace (not append)
+    // whatever the partial updates already rendered, so counts can't drift.
     state.results = Array.isArray(data.results) ? data.results : (data.results ? [data.results] : []);
     state.skipped = Array.isArray(data.skippedFiles) ? data.skippedFiles : (data.skippedFiles ? [data.skippedFiles] : []);
     state.sourcePath = data.sourcePath || path;
@@ -146,7 +166,7 @@ $('scanBtn').addEventListener('click', async () => {
     state.ocrSelected = new Set(state.skipped.filter(isOcrCandidate).map(s => s.fullPath));
 
     let msg = `Scanned ${data.scannedFiles} of ${data.totalFiles} file(s), ${state.results.length} match row(s).`;
-    if (state.skipped.length) msg += ` ${state.skipped.length} file(s) skipped - see below.`;
+    if (state.skipped.length) msg += ` ${state.skipped.length} file(s) skipped/failed - see below.`;
     setStatus(msg);
 
     populateFilterOptions();
@@ -161,13 +181,15 @@ $('scanBtn').addEventListener('click', async () => {
 });
 
 // Reads a streamed NDJSON response from /api/scan, invoking onProgress for
-// each 'progress' line, and returns the payload of the final 'done' line.
-async function readNdjsonScanResponse(res, onProgress) {
+// each 'progress' line and onPartial for each 'partial' line (newly-found
+// result/skipped rows, so the UI can render them live), and returns the
+// payload of the final 'done' line.
+async function readNdjsonScanResponse(res, onProgress, onPartial) {
   if (!res.body || !res.body.getReader) {
     // Fallback for environments without streaming fetch support: read the
     // whole body at once and parse it the same way.
     const text = await res.text();
-    return parseNdjsonText(text, onProgress);
+    return parseNdjsonText(text, onProgress, onPartial);
   }
 
   const reader = res.body.getReader();
@@ -184,7 +206,8 @@ async function readNdjsonScanResponse(res, onProgress) {
     for (const line of lines) {
       const msg = parseNdjsonLine(line);
       if (!msg) continue;
-      if (msg.type === 'progress') onProgress(msg.processed, msg.total, msg.currentFile, msg.findingsCount);
+      if (msg.type === 'progress') onProgress(msg.processed, msg.total, msg.currentFile, msg.findingsCount, msg.skipped);
+      else if (msg.type === 'partial') onPartial && onPartial(msg.newResults || [], msg.newSkipped || []);
       else if (msg.type === 'done') done = msg;
     }
   }
@@ -194,12 +217,13 @@ async function readNdjsonScanResponse(res, onProgress) {
   return done;
 }
 
-function parseNdjsonText(text, onProgress) {
+function parseNdjsonText(text, onProgress, onPartial) {
   let done = null;
   text.split('\n').forEach(line => {
     const msg = parseNdjsonLine(line);
     if (!msg) return;
-    if (msg.type === 'progress') onProgress(msg.processed, msg.total, msg.currentFile, msg.findingsCount);
+    if (msg.type === 'progress') onProgress(msg.processed, msg.total, msg.currentFile, msg.findingsCount, msg.skipped);
+    else if (msg.type === 'partial') onPartial && onPartial(msg.newResults || [], msg.newSkipped || []);
     else if (msg.type === 'done') done = msg;
   });
   return done;
@@ -239,7 +263,7 @@ function showOcrProgress(visible) {
   $('ocrProgressPanel').style.display = visible ? 'block' : 'none';
 }
 
-function setOcrProgress(processed, total, currentFile, findingsCount) {
+function setOcrProgress(processed, total, currentFile, findingsCount, skippedCount) {
   const pct = total > 0 ? Math.round((processed / total) * 100) : 0;
   $('ocrProgressBarFill').style.width = pct + '%';
   $('ocrProgressPercent').textContent = pct + '%';
@@ -249,6 +273,10 @@ function setOcrProgress(processed, total, currentFile, findingsCount) {
   const findingsEl = $('ocrProgressFindings');
   findingsEl.textContent = typeof findingsCount === 'number'
     ? `${findingsCount} finding${findingsCount === 1 ? '' : 's'} so far`
+    : '';
+  const skippedEl = $('ocrProgressSkipped');
+  skippedEl.textContent = typeof skippedCount === 'number' && skippedCount > 0
+    ? `${skippedCount} still unreadable`
     : '';
 }
 
@@ -267,7 +295,7 @@ $('ocrBtn').addEventListener('click', async () => {
 
   state.ocrRunning = true;
   updateOcrButton();
-  setOcrProgress(0, 0, '', 0);
+  setOcrProgress(0, 0, '', 0, 0);
   showOcrProgress(true);
   setStatus(`Running OCR on ${items.length} PDF(s)...`);
 
@@ -289,8 +317,8 @@ $('ocrBtn').addEventListener('click', async () => {
       throw new Error(data.error || 'OCR failed');
     }
 
-    const data = await readNdjsonScanResponse(res, (processed, total, currentFile, findingsCount) => {
-      setOcrProgress(processed, total, currentFile, findingsCount);
+    const data = await readNdjsonScanResponse(res, (processed, total, currentFile, findingsCount, skippedCount) => {
+      setOcrProgress(processed, total, currentFile, findingsCount, skippedCount);
     });
 
     if (!data) throw new Error('OCR did not complete - no results received');
