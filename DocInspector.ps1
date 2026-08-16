@@ -281,6 +281,12 @@ function Get-BinaryHeuristicText {
     } catch {
         return ''
     }
+    return Get-HeuristicTextFromBytes -Bytes $bytes -MinRun $MinRun
+}
+
+function Get-HeuristicTextFromBytes {
+    param([byte[]]$Bytes, [int]$MinRun = 6)
+    $bytes = $Bytes
     $n = $bytes.Length
     if ($n -eq 0) { return '' }
     $ansi = [System.Text.Encoding]::GetEncoding(1252)
@@ -341,6 +347,180 @@ function Get-BinaryHeuristicText {
         }
     }
     return $sb.ToString()
+}
+
+function Get-CfbStreamBytes {
+    <#
+        Minimal reader for the OLE Compound File Binary format (the
+        container format .doc/.xls files use, and the same format used for
+        old-style embedded objects). A CFB file is effectively a small
+        filesystem: it holds multiple independent named streams (e.g.
+        "WordDocument", "1Table", "SummaryInformation", and - critically for
+        this fix - separate streams/storages for embedded pictures and OLE
+        objects). This extracts ONLY the bytes of the first stream whose
+        name matches one of $StreamNames, so a caller can scan just the
+        stream that holds real body text (e.g. "WordDocument" for .doc)
+        instead of the whole file - which means embedded image bytes,
+        living in entirely separate streams, are never even read by the
+        text-extraction heuristic in the first place. That's a structural
+        fix rather than a "guess better ranges" fix.
+
+        Returns $null on anything unexpected (not a CFB file, requested
+        stream not found, or a container shape this lightweight reader
+        doesn't support) so the caller can safely fall back to whole-file
+        scanning instead of failing outright.
+    #>
+    param($Path, [string[]]$StreamNames)
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($Path)
+        $n = $bytes.Length
+        if ($n -lt 512) { return $null }
+
+        $cfbSignature = @(0xD0,0xCF,0x11,0xE0,0xA1,0xB1,0x1A,0xE1)
+        for ($s = 0; $s -lt 8; $s++) { if ($bytes[$s] -ne $cfbSignature[$s]) { return $null } }
+
+        $sectorShift        = [BitConverter]::ToUInt16($bytes, 0x1E)
+        $miniSectorShift    = [BitConverter]::ToUInt16($bytes, 0x20)
+        $numFatSectorsHdr   = [BitConverter]::ToUInt32($bytes, 0x2C)
+        $firstDirSector     = [BitConverter]::ToUInt32($bytes, 0x30)
+        $miniStreamCutoff   = [BitConverter]::ToUInt32($bytes, 0x38)
+        $firstMiniFatSector = [BitConverter]::ToUInt32($bytes, 0x3C)
+        $numMiniFatSectors  = [BitConverter]::ToUInt32($bytes, 0x40)
+        $numDifatSectors    = [BitConverter]::ToUInt32($bytes, 0x48)
+
+        # Sanity-bound the header fields before trusting them for arithmetic
+        # below - a corrupt/malformed file could otherwise send this into
+        # huge allocations or an infinite loop.
+        if ($sectorShift -lt 6 -or $sectorShift -gt 16) { return $null }
+        $sectorSize = 1 -shl $sectorShift
+        $miniSectorSize = 1 -shl $miniSectorShift
+
+        if ($numDifatSectors -gt 0) {
+            # Container needs the extended DIFAT sector chain (only happens
+            # for files with hundreds of MB+ of FAT-addressable content) -
+            # not supported by this lightweight reader. Real Office .doc/.xls
+            # files are essentially never this large; caller falls back to
+            # whole-file heuristic scanning.
+            return $null
+        }
+        if ($numFatSectorsHdr -eq 0 -or $numFatSectorsHdr -gt 1000) { return $null }
+
+        function Get-SectorOffset([uint32]$sectorNum) { return 512 + ([int64]$sectorNum * $sectorSize) }
+
+        # Build the FAT from the up-to-109 FAT sector numbers embedded
+        # directly in the header (the common case - see numDifatSectors
+        # check above).
+        $difat = New-Object System.Collections.Generic.List[uint32]
+        for ($i = 0; $i -lt 109; $i++) {
+            $val = [BitConverter]::ToUInt32($bytes, 0x4C + $i * 4)
+            if ($val -ne 0xFFFFFFFF) { $difat.Add($val) }
+        }
+        if ($difat.Count -eq 0) { return $null }
+
+        $entriesPerSector = [int]($sectorSize / 4)
+        $fat = New-Object 'uint32[]' ($difat.Count * $entriesPerSector)
+        $fi = 0
+        foreach ($fatSector in $difat) {
+            $off = Get-SectorOffset $fatSector
+            if (($off + $sectorSize) -gt $n) { return $null }
+            for ($e = 0; $e -lt $entriesPerSector; $e++) {
+                $fat[$fi] = [BitConverter]::ToUInt32($bytes, $off + $e * 4)
+                $fi++
+            }
+        }
+
+        # Follows a FAT sector chain and returns the concatenated raw bytes
+        # (sector-aligned - may be slightly longer than the stream's actual
+        # recorded size, which the caller trims to).
+        function Get-FatChainBytes([uint32]$startSector) {
+            $ms = New-Object System.IO.MemoryStream
+            $sector = $startSector
+            $guard = 0
+            $maxGuard = $fat.Length + 16
+            while ($sector -ne 0xFFFFFFFE -and $sector -lt $fat.Length -and $guard -lt $maxGuard) {
+                $off = Get-SectorOffset $sector
+                if (($off + $sectorSize) -gt $n) { break }
+                $ms.Write($bytes, $off, $sectorSize)
+                $sector = $fat[$sector]
+                $guard++
+            }
+            return $ms.ToArray()
+        }
+
+        $dirBytes = Get-FatChainBytes $firstDirSector
+        $entrySize = 128
+        $numEntries = [int]([Math]::Floor($dirBytes.Length / $entrySize))
+
+        $rootStartSector = $null
+        $rootStreamSize = $null
+        $found = $null
+
+        for ($ei = 0; $ei -lt $numEntries; $ei++) {
+            $eoff = $ei * $entrySize
+            $nameLenBytes = [BitConverter]::ToUInt16($dirBytes, $eoff + 0x40)
+            $objType = $dirBytes[$eoff + 0x42]
+            if ($nameLenBytes -lt 2 -or $nameLenBytes -gt 64) { continue }
+            $nameCharCount = [int](($nameLenBytes - 2) / 2)
+            if ($nameCharCount -le 0) { continue }
+            $name = [System.Text.Encoding]::Unicode.GetString($dirBytes, $eoff, $nameCharCount * 2)
+            $startSector = [BitConverter]::ToUInt32($dirBytes, $eoff + 0x74)
+            $sizeLow = [BitConverter]::ToUInt32($dirBytes, $eoff + 0x78)
+
+            if ($objType -eq 5) {
+                # Root storage entry - needed below if the target stream
+                # turns out to be small enough to live in the mini-stream.
+                $rootStartSector = $startSector
+                $rootStreamSize = $sizeLow
+            }
+            if ($objType -eq 2 -and ($StreamNames -contains $name)) {
+                $found = @{ StartSector = $startSector; Size = $sizeLow }
+            }
+        }
+
+        if (-not $found) { return $null }
+
+        if ($found.Size -ge $miniStreamCutoff) {
+            $raw = Get-FatChainBytes $found.StartSector
+            $take = [Math]::Min([int64]$found.Size, [int64]$raw.Length)
+            if ($take -le 0) { return $null }
+            $result = New-Object 'byte[]' $take
+            [Array]::Copy($raw, $result, [int]$take)
+            return $result
+        }
+
+        # Small stream: lives inside the "mini stream" (the root storage's
+        # own data, itself read via the regular FAT chain above), chained in
+        # $miniSectorSize-byte units via the MiniFAT.
+        if ($null -eq $rootStartSector -or $numMiniFatSectors -eq 0) { return $null }
+        $miniStreamBytes = Get-FatChainBytes $rootStartSector
+        $miniFatBytes = Get-FatChainBytes $firstMiniFatSector
+        $miniFatCount = [int]([Math]::Floor($miniFatBytes.Length / 4))
+        if ($miniFatCount -eq 0) { return $null }
+        $miniFat = New-Object 'uint32[]' $miniFatCount
+        for ($m = 0; $m -lt $miniFatCount; $m++) {
+            $miniFat[$m] = [BitConverter]::ToUInt32($miniFatBytes, $m * 4)
+        }
+
+        $outMs = New-Object System.IO.MemoryStream
+        $msector = $found.StartSector
+        $guard = 0
+        $maxGuard = $miniFat.Length + 16
+        while ($msector -ne 0xFFFFFFFE -and $msector -lt $miniFat.Length -and $guard -lt $maxGuard) {
+            $moff = [int64]$msector * $miniSectorSize
+            if (($moff + $miniSectorSize) -gt $miniStreamBytes.Length) { break }
+            $outMs.Write($miniStreamBytes, $moff, $miniSectorSize)
+            $msector = $miniFat[$msector]
+            $guard++
+        }
+        $rawMini = $outMs.ToArray()
+        $take = [Math]::Min([int64]$found.Size, [int64]$rawMini.Length)
+        if ($take -le 0) { return $null }
+        $result = New-Object 'byte[]' $take
+        [Array]::Copy($rawMini, $result, [int]$take)
+        return $result
+    } catch {
+        return $null
+    }
 }
 
 function Get-DocText {
@@ -666,12 +846,26 @@ function Get-FileText {
             # Confluence export .doc files that are actually HTML or MHTML.
             # Detect the real format from content, not the extension.
             if (Test-IsOleCompoundFile -Path $Path) {
-                # Primary path: byte-level heuristic extraction. Needs no
-                # Word install/license/COM cooperation at all, so this alone
-                # already covers the overwhelming majority of real .doc
-                # files even on a machine where Word automation is fully
-                # broken.
-                $heuristicText = Get-BinaryHeuristicText -Path $Path
+                # Best path: isolate and scan ONLY the "WordDocument" stream
+                # (where the real body text lives) rather than the whole
+                # file. Embedded pictures/OLE objects live in entirely
+                # separate streams within the same container, so this
+                # structurally avoids ever reading their bytes at all -
+                # rather than trying to filter out image noise after the
+                # fact, which can never be fully reliable since compressed
+                # image data can still coincidentally look like "valid" text
+                # under any character-range heuristic.
+                $streamBytes = Get-CfbStreamBytes -Path $Path -StreamNames @('WordDocument')
+                if ($streamBytes) {
+                    $heuristicText = Get-HeuristicTextFromBytes -Bytes $streamBytes
+                } else {
+                    # Couldn't parse the container (unsupported shape, or a
+                    # genuinely malformed file) - fall back to the old
+                    # whole-file scan so we still recover text rather than
+                    # nothing, accepting the small risk of image-byte noise
+                    # in this fallback-only case.
+                    $heuristicText = Get-BinaryHeuristicText -Path $Path
+                }
 
                 # Word COM is now purely a bonus, tried only when the
                 # heuristic came back thin (e.g. a file that's mostly
@@ -701,10 +895,20 @@ function Get-FileText {
             }
         }
         '.xls'  {
-            # Same heuristic-first approach as .doc: BIFF (.xls) binary
-            # records also store cell strings as recoverable UTF-16LE/CP1252
-            # runs, so this needs no Excel install at all for the common case.
-            $heuristicText = Get-BinaryHeuristicText -Path $Path
+            # Excel's binary format is less strictly separated than Word's -
+            # embedded drawings are often interleaved as records inside the
+            # same "Workbook"/"Book" stream as cell data, rather than living
+            # in a fully separate stream. Isolating to that stream still
+            # helps (it skips unrelated streams like SummaryInformation and
+            # any separately-stored embedded OLE objects), but unlike .doc
+            # it won't eliminate 100% of inline-drawing noise. Still
+            # strictly better than scanning the whole file.
+            $streamBytes = Get-CfbStreamBytes -Path $Path -StreamNames @('Workbook', 'Book')
+            $heuristicText = if ($streamBytes) {
+                Get-HeuristicTextFromBytes -Bytes $streamBytes
+            } else {
+                Get-BinaryHeuristicText -Path $Path
+            }
             if ([string]::IsNullOrWhiteSpace($heuristicText) -or $heuristicText.Trim().Length -lt 40) {
                 $excelText = Get-XlsText -Path $Path
                 if ($excelText -and $excelText.Trim().Length -gt $heuristicText.Trim().Length) {
