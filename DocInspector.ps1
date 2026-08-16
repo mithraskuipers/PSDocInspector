@@ -261,10 +261,21 @@ function Get-BinaryHeuristicText {
         perfectly, but for keyword search purposes (the only thing this tool
         needs) it reliably recovers the actual words in the file regardless
         of whether Word is present, licensed, or currently able to start.
-        Runs shorter than $MinRun are treated as noise (stray printable bytes
-        inside binary formatting records) and discarded.
+
+        IMPORTANT: the "printable" ranges below are deliberately narrow
+        (essentially ASCII + Western-European Latin + common typographic
+        punctuation), NOT "anything Unicode considers a letter". Random
+        binary bytes (compressed streams, OLE structure tables, formatting
+        records) reinterpreted as UTF-16LE code units land somewhere in the
+        Unicode range purely by chance; if that range is allowed to include
+        huge blocks like CJK Unified Ideographs or Hangul, binary noise gets
+        misdecoded into what looks like real (but bogus) Chinese/Japanese/
+        Korean text mixed into results. Keeping the allowed ranges tight to
+        what Western business documents actually use avoids that entirely.
+        Runs shorter than $MinRun are treated as noise (stray printable
+        bytes inside binary formatting records) and discarded.
     #>
-    param($Path, [int]$MinRun = 5)
+    param($Path, [int]$MinRun = 6)
     try {
         $bytes = [System.IO.File]::ReadAllBytes($Path)
     } catch {
@@ -273,28 +284,49 @@ function Get-BinaryHeuristicText {
     $n = $bytes.Length
     if ($n -eq 0) { return '' }
     $ansi = [System.Text.Encoding]::GetEncoding(1252)
+
+    # CP1252's 0x80-0x9F block is mostly either undefined or control
+    # characters, with a handful of real typographic punctuation mixed in.
+    # Allow only those specific known-good code points instead of the whole
+    # block, so undefined/control bytes in that range aren't treated as text.
+    $cp1252SpecialAllowed = @(0x80,0x82,0x83,0x84,0x85,0x86,0x87,0x88,0x89,0x8A,0x8B,0x8C,0x8E,0x91,0x92,0x93,0x94,0x95,0x96,0x97,0x98,0x99,0x9A,0x9B,0x9C,0x9E,0x9F)
+
     $sb = New-Object System.Text.StringBuilder
     $i = 0
     while ($i -lt $n) {
-        # Longest run readable as UTF-16LE starting at $i.
+        # Longest run readable as UTF-16LE starting at $i. Allowed: tab/LF/CR,
+        # ASCII printable, Latin-1 Supplement + Latin Extended-A/B (covers
+        # accented Western/Central European text), and common typographic
+        # punctuation (curly quotes, dashes, ellipsis, Euro/trademark signs).
+        # Deliberately excludes CJK, Hangul, and other large scripts - see
+        # comment above.
         $j = $i
         while (($j + 1) -lt $n) {
             $code = $bytes[$j] -bor ($bytes[$j + 1] -shl 8)
             $printable = ($code -eq 9 -or $code -eq 10 -or $code -eq 13) -or
                          ($code -ge 32 -and $code -le 126) -or
-                         ($code -ge 160 -and $code -le 0xFFFD -and $code -ne 0xFEFF)
+                         ($code -ge 0xA0 -and $code -le 0x24F) -or
+                         ($code -ge 0x2010 -and $code -le 0x2027) -or
+                         ($code -ge 0x2030 -and $code -le 0x2039) -or
+                         ($code -eq 0x20AC -or $code -eq 0x2122)
             if (-not $printable) { break }
             $j += 2
         }
         $run16 = $j - $i
 
-        # Longest run readable as 8-bit CP1252 starting at $i.
+        # Longest run readable as 8-bit CP1252 starting at $i. Allowed:
+        # tab/LF/CR, ASCII printable, the curated CP1252 0x80-0x9F subset
+        # above, and the full 0xA0-0xFF Latin-1 Supplement block (accented
+        # characters and common symbols, all genuinely printable in CP1252).
         $k = $i
         while ($k -lt $n) {
             $b = $bytes[$k]
-            if ($b -eq 9 -or $b -eq 10 -or $b -eq 13 -or ($b -ge 32 -and $b -le 126) -or $b -ge 128) {
-                $k++
-            } else { break }
+            $printable8 = $b -eq 9 -or $b -eq 10 -or $b -eq 13 -or
+                          ($b -ge 32 -and $b -le 126) -or
+                          ($b -ge 0xA0) -or
+                          ($cp1252SpecialAllowed -contains $b)
+            if (-not $printable8) { break }
+            $k++
         }
         $run8 = $k - $i
 
