@@ -28,6 +28,23 @@ function parseKeywords(raw) {
   return raw.split(/[\n,]/).map(s => s.trim()).filter(Boolean);
 }
 
+// ---------- Stop server ----------
+
+$('stopServerBtn').addEventListener('click', async () => {
+  if (!confirm('Stop the DocInspector server? This will close the connection and the app will stop working until it is started again.')) return;
+  setStatus('Stopping server...');
+  $('stopServerBtn').disabled = true;
+  try {
+    await fetch('/api/shutdown', { method: 'POST' });
+  } catch (e) {
+    // The server closes the connection as part of shutting down, so a
+    // failed/aborted fetch here is the expected outcome, not an error.
+  }
+  setStatus('Server stopped. You can close this tab.');
+  document.body.style.opacity = '0.5';
+  document.body.style.pointerEvents = 'none';
+});
+
 // ---------- Browse ----------
 
 $('browseBtn').addEventListener('click', async () => {

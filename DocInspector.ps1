@@ -1613,6 +1613,16 @@ function Handle-Request {
             if ($method -eq 'POST') { Invoke-OpenFileRequest -Context $Context }
             else { $Context.Response.StatusCode = 405; $Context.Response.OutputStream.Close() }
         }
+        '^/api/shutdown$' {
+            if ($method -eq 'POST') {
+                Send-Json -Context $Context -Data @{ ok = $true }
+                # Flag checked by the main loop below; setting it here (rather
+                # than stopping the listener inline) lets this handler return
+                # its response to the browser before the listener is torn
+                # down, so the client's fetch resolves instead of aborting.
+                $script:ShutdownRequested = $true
+            } else { $Context.Response.StatusCode = 405; $Context.Response.OutputStream.Close() }
+        }
         default {
             $Context.Response.StatusCode = 404
             $Context.Response.OutputStream.Close()
@@ -1647,10 +1657,22 @@ $listener.Start()
 Write-Host "DocInspector running at $prefix"
 Start-Process $prefix
 
+$script:ShutdownRequested = $false
+
 try {
-    while ($listener.IsListening) {
+    while ($listener.IsListening -and -not $script:ShutdownRequested) {
+        # GetContextAsync + WaitOne on a timeout lets the loop periodically
+        # re-check $script:ShutdownRequested even when no new request is
+        # coming in, instead of blocking forever inside a synchronous
+        # GetContext() call.
+        $contextTask = $listener.GetContextAsync()
+        while (-not $contextTask.AsyncWaitHandle.WaitOne(250)) {
+            if ($script:ShutdownRequested) { break }
+        }
+        if ($script:ShutdownRequested) { break }
+
         try {
-            $context = $listener.GetContext()
+            $context = $contextTask.GetAwaiter().GetResult()
         } catch {
             Write-Host "GetContext error (ignored, still listening): $($_.Exception.Message)" -ForegroundColor Yellow
             continue
@@ -1666,6 +1688,9 @@ try {
                 $context.Response.OutputStream.Close()
             } catch {}
         }
+    }
+    if ($script:ShutdownRequested) {
+        Write-Host "Shutdown requested from browser - stopping server." -ForegroundColor Cyan
     }
 } finally {
     if ($script:WordApp) {
