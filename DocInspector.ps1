@@ -103,12 +103,60 @@ function ConvertFrom-QuotedPrintableBytes {
     return $bytes.ToArray()
 }
 
-function Get-EncodingByName {
-    param([string]$Name)
+function Get-TextFromBytesSafe {
+    <#
+        Decodes bytes as text using a declared/assumed charset, but never
+        trusts that charset blindly the way a plain Encoding.GetString call
+        does.
+
+        .NET's default UTF8Encoding is LENIENT: bytes that are not actually
+        valid UTF-8 don't throw, they get silently replaced or - worse -
+        occasionally happen to form a technically-valid multi-byte UTF-8
+        sequence purely by chance and decode to some unrelated character.
+        This matters a lot here because CJK Unified Ideographs alone occupy
+        roughly a third of the code points reachable by a 3-byte UTF-8
+        sequence, so when bytes that were never meant to be text (leftover
+        MIME/base64/binary noise from a mis-parsed part) get run through a
+        lenient UTF-8 decode, the result systematically skews towards
+        bogus-looking Chinese/Japanese characters rather than obvious
+        garbage - exactly the symptom of misdecoded content, not a
+        translation issue.
+
+        To prevent that: when the target encoding is UTF-8, decode STRICTLY
+        (throws on the first invalid byte sequence). If it throws - or the
+        requested charset name doesn't resolve at all - fall back to
+        Windows-1252, which assigns a character to every possible byte
+        value and therefore can never throw, so a Western business document
+        with a wrong/missing charset declaration still renders as readable
+        (at worst slightly mis-accented) text instead of Asian-script noise.
+    #>
+    param([byte[]]$Bytes, [string]$CharsetName)
+    if (-not $Bytes -or $Bytes.Length -eq 0) { return '' }
+
+    $name = if ([string]::IsNullOrWhiteSpace($CharsetName)) { 'UTF-8' } else { $CharsetName.Trim() }
+    $cp1252 = [System.Text.Encoding]::GetEncoding(1252)
+
     try {
-        return [System.Text.Encoding]::GetEncoding($Name.Trim())
+        $requested = [System.Text.Encoding]::GetEncoding($name)
     } catch {
-        return [System.Text.Encoding]::UTF8
+        $requested = [System.Text.Encoding]::UTF8
+    }
+
+    if ($requested.CodePage -eq [System.Text.Encoding]::UTF8.CodePage) {
+        try {
+            # throwOnInvalidBytes: $true - a lenient decode here is exactly
+            # what lets binary noise masquerade as valid-looking text.
+            $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+            return $strictUtf8.GetString($Bytes)
+        } catch {
+            return $cp1252.GetString($Bytes)
+        }
+    }
+
+    try {
+        return $requested.GetString($Bytes)
+    } catch {
+        return $cp1252.GetString($Bytes)
     }
 }
 
@@ -136,6 +184,22 @@ function ConvertTo-PlainTextFromHtml {
     $t = [regex]::Replace($t, '<xml\b[^>]*>.*?</xml>', ' ', $optsI)
     $t = [regex]::Replace($t, '<head\b[^>]*>.*?</head>', ' ', $optsI)
 
+    # Belt-and-suspenders against embedded image/font data ending up in
+    # extracted "text": a data: URI is normally removed along with its
+    # whole <img>/<source> tag by the generic tag-stripper below, but a
+    # truncated/malformed tag (common in the loosely-formed HTML some
+    # export tools emit) could otherwise leave a multi-KB base64 blob
+    # sitting in what's supposed to be plain document text. Strip any
+    # data: URI payload explicitly, wherever it occurs.
+    $t = [regex]::Replace($t, '(?i)data:[a-z0-9.+-]+/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+', ' ')
+
+    # Word's VML image/shape data (o:pict, v:shape, v:imagedata etc.) is
+    # never visible document text either - drop those elements wholesale
+    # rather than relying only on the generic tag stripper, since they can
+    # carry large embedded binary payloads as element content, not just as
+    # attributes.
+    $t = [regex]::Replace($t, '<(o:pict|v:shape|v:imagedata|v:rect|v:group)\b[^>]*>.*?</\1>', ' ', $optsI)
+
     # Turn block/line-break boundaries into newlines before stripping tags,
     # so words from separate elements don't run together.
     $t = [regex]::Replace($t, '(?i)<(br|/p|/div|/tr|/li|/h[1-6]|/table)\s*/?>', "`n")
@@ -146,6 +210,14 @@ function ConvertTo-PlainTextFromHtml {
     # Decode HTML entities (&amp;, &nbsp;, &#8217;, etc.)
     $t = [System.Net.WebUtility]::HtmlDecode($t)
 
+    # Final safety net: drop the Unicode replacement character (produced
+    # when any upstream decode step could not represent a byte sequence)
+    # and other non-printable control characters, so a decoding problem
+    # anywhere upstream shows up as missing text rather than visible
+    # garbage symbols in the results.
+    $t = $t -replace [char]0xFFFD, ''
+    $t = [regex]::Replace($t, '[\x00-\x08\x0B\x0C\x0E-\x1F]', '')
+
     # Collapse whitespace produced by the tag stripping above.
     $t = [regex]::Replace($t, '[ \t]+', ' ')
     $t = [regex]::Replace($t, '\n[ \t]*', "`n")
@@ -153,17 +225,123 @@ function ConvertTo-PlainTextFromHtml {
     return $t.Trim()
 }
 
+function Get-MimePartsHtml {
+    <#
+        Splits $Body on a known MIME $Boundary and returns the decoded text
+        of the first text/html part found, recursing into any nested
+        multipart part (e.g. multipart/alternative inside the outer
+        multipart/related) using THAT part's own declared boundary. The
+        boundary is always passed down explicitly rather than re-discovered
+        by searching the body text, because a nested part's Content-Type
+        header (which is where its boundary is declared) lives in the
+        header block that gets stripped off before recursing - searching
+        the leftover body for a fresh "Content-Type: multipart" line would
+        never find it.
+    #>
+    param([string]$Body, [string]$Boundary, [System.Text.Encoding]$Latin1, [int]$Depth = 0)
+    if ($Depth -gt 5 -or -not $Boundary) { return $null }
+
+    $splitToken = "--$Boundary"
+    $parts = $Body -split [regex]::Escape($splitToken)
+
+    foreach ($part in $parts) {
+        $sep = $part.IndexOf("`r`n`r`n")
+        if ($sep -lt 0) { $sep = $part.IndexOf("`n`n") }
+        if ($sep -lt 0) { continue }
+
+        $headerBlock = $part.Substring(0, $sep)
+        $bodyBlock = $part.Substring($sep).TrimStart("`r", "`n")
+
+        if ($headerBlock -match '(?im)^\s*Content-Type:\s*multipart/[\w.+-]+') {
+            # Nested multipart (e.g. multipart/alternative inside the outer
+            # multipart/related) - recurse into its own body using ITS OWN
+            # boundary, rather than treating this part itself as HTML
+            # content or trying to re-find a boundary that's no longer in
+            # scope.
+            $nestedBoundaryMatch = [regex]::Match($headerBlock, '(?is)boundary\s*=\s*"?([^";\r\n]+)"?')
+            if ($nestedBoundaryMatch.Success) {
+                $nested = Get-MimePartsHtml -Body $bodyBlock -Boundary $nestedBoundaryMatch.Groups[1].Value.Trim() -Latin1 $Latin1 -Depth ($Depth + 1)
+                if ($nested) { return $nested }
+            }
+            continue
+        }
+
+        if ($headerBlock -notmatch '(?im)^\s*Content-Type:\s*text/html') { continue }
+
+        # A genuine text/html part - decode it, never anything else.
+        $charset = 'UTF-8'
+        $csMatch = [regex]::Match($headerBlock, '(?i)charset\s*=\s*"?([\w\-]+)"?')
+        if ($csMatch.Success) { $charset = $csMatch.Groups[1].Value }
+
+        if ($headerBlock -match '(?im)^\s*Content-Transfer-Encoding:\s*quoted-printable') {
+            $bodyBytes = ConvertFrom-QuotedPrintableBytes -Text $bodyBlock
+        } elseif ($headerBlock -match '(?im)^\s*Content-Transfer-Encoding:\s*base64') {
+            try {
+                $bodyBytes = [Convert]::FromBase64String(($bodyBlock -replace '\s', ''))
+            } catch {
+                # Declared base64 but not actually valid base64 - treat as
+                # opaque bytes rather than guessing; this part is suspect,
+                # keep looking instead of returning corrupted content.
+                continue
+            }
+        } else {
+            $bodyBytes = $Latin1.GetBytes($bodyBlock)
+        }
+
+        return Get-TextFromBytesSafe -Bytes $bodyBytes -CharsetName $charset
+    }
+
+    return $null
+}
+
+function Find-MimeHtmlPart {
+    <#
+        Locates the outermost MIME boundary in a multipart MHTML payload
+        and, from there, finds and decodes the first text/html part
+        anywhere in the (possibly nested) structure.
+
+        Real-world exports (Confluence's "Export to Word" being the classic
+        example - it actually produces MHTML, not a real .doc) don't always
+        put the HTML directly under the top-level multipart/related part:
+        some wrap it in a nested multipart/alternative first. A parser that
+        only ever looks one level deep silently fails to find the HTML part
+        for those files. That failure used to be "handled" by falling back
+        to dumping the *entire* raw multipart payload - MIME headers,
+        quoted-printable escapes, and base64-encoded image/font binary
+        included - into the plain-text pipeline. That's the root cause of
+        images being "interpreted" as text, URLs being torn apart by
+        un-decoded soft line breaks, and binary bytes being misdecoded into
+        bogus CJK-looking characters. This function never does that: it
+        only ever returns content it has positively identified and decoded
+        as a text/html part, and returns $null if no such part exists
+        anywhere in the structure, so the caller can fail closed instead of
+        guessing.
+    #>
+    param([string]$Raw, [System.Text.Encoding]$Latin1)
+
+    $boundaryMatch = [regex]::Match($Raw, '(?is)Content-Type:\s*multipart/[\w.+-]+;.*?boundary\s*=\s*"?([^";\r\n]+)"?')
+    if (-not $boundaryMatch.Success) { return $null }
+
+    $boundary = $boundaryMatch.Groups[1].Value.Trim()
+    if (-not $boundary) { return $null }
+
+    return Get-MimePartsHtml -Body $Raw -Boundary $boundary -Latin1 $Latin1
+}
+
 function Get-DocHtmlText {
     <#
         Extracts human-readable text from a .doc file that is actually
         HTML or MHTML content (e.g. exported from Confluence) rather than a
         genuine binary Word document. Handles both a bare HTML/Word-HTML
-        payload and a full MHTML multipart/related package, decoding
-        quoted-printable/base64 bodies and the declared charset before
-        stripping markup. Returns '' (not $null) on any parse failure so the
-        caller reports "no readable text" instead of a misleading
-        Word-unavailable message, and so a malformed file never crashes
-        the scan.
+        payload and a full MHTML multipart/related package (including
+        parts nested under multipart/alternative), decoding quoted-
+        printable/base64 bodies and the declared charset before stripping
+        markup. Returns '' (not $null) on any parse failure - including
+        when an MHTML package's text/html part can't be positively
+        identified - so the caller reports "no readable text" instead of
+        a misleading Word-unavailable message, a malformed file never
+        crashes the scan, and (critically) undecoded MIME structure or
+        embedded image/font binary is never mistaken for document text.
     #>
     param($Path)
     try {
@@ -184,59 +362,33 @@ function Get-DocHtmlText {
         $htmlFragment = $null
 
         if ($raw -match '(?im)^\s*(MIME-Version:|Content-Type:\s*multipart/related)') {
-            $boundaryMatch = [regex]::Match($raw, '(?is)Content-Type:\s*multipart/related;.*?boundary\s*=\s*"?([^";\r\n]+)"?')
-            if ($boundaryMatch.Success) {
-                $boundary = $boundaryMatch.Groups[1].Value.Trim()
-                if ($boundary) {
-                    $splitToken = "--$boundary"
-                    $parts = $raw -split [regex]::Escape($splitToken)
-                    foreach ($part in $parts) {
-                        if ($part -notmatch '(?im)^\s*Content-Type:\s*text/html') { continue }
+            $htmlFragment = Find-MimeHtmlPart -Raw $raw -Latin1 $latin1
 
-                        $sep = $part.IndexOf("`r`n`r`n")
-                        if ($sep -lt 0) { $sep = $part.IndexOf("`n`n") }
-                        if ($sep -lt 0) { continue }
-
-                        $headerBlock = $part.Substring(0, $sep)
-                        $bodyBlock = $part.Substring($sep).TrimStart("`r", "`n")
-
-                        $charset = 'UTF-8'
-                        $csMatch = [regex]::Match($headerBlock, '(?i)charset\s*=\s*"?([\w\-]+)"?')
-                        if ($csMatch.Success) { $charset = $csMatch.Groups[1].Value }
-
-                        if ($headerBlock -match '(?im)^\s*Content-Transfer-Encoding:\s*quoted-printable') {
-                            $bodyBytes = ConvertFrom-QuotedPrintableBytes -Text $bodyBlock
-                        } elseif ($headerBlock -match '(?im)^\s*Content-Transfer-Encoding:\s*base64') {
-                            try {
-                                $bodyBytes = [Convert]::FromBase64String(($bodyBlock -replace '\s', ''))
-                            } catch {
-                                $bodyBytes = $latin1.GetBytes($bodyBlock)
-                            }
-                        } else {
-                            $bodyBytes = $latin1.GetBytes($bodyBlock)
-                        }
-
-                        $enc = Get-EncodingByName -Name $charset
-                        $htmlFragment = $enc.GetString($bodyBytes)
-                        break
-                    }
-                }
-            }
             if (-not $htmlFragment) {
-                # Couldn't isolate the text/html MIME part (unexpected
-                # boundary format, etc.) - fall back to the whole payload so
-                # markup stripping still has a chance to recover the text
-                # rather than reporting zero content outright.
-                $htmlFragment = $raw
+                # Couldn't positively identify a text/html MIME part
+                # anywhere in the structure (unrecognized boundary format,
+                # unexpected nesting, etc). Deliberately do NOT fall back to
+                # the raw multipart payload here - it still contains MIME
+                # headers, un-decoded quoted-printable escapes, and/or
+                # base64-encoded image/font binary, all of which would
+                # otherwise get reported as "document text". Reporting no
+                # extractable text is far safer than reporting corrupted
+                # text, so this file falls through to manual inspection
+                # instead.
+                return ''
             }
         } else {
             # Not MHTML - treat as a bare HTML/Word-HTML document saved with
-            # a .doc extension. Respect a declared <meta charset> if present.
+            # a .doc extension. Respect a declared <meta charset> if present,
+            # restricted to the <head> section so a stray "charset=" mention
+            # in the visible body text can never be mistaken for the page's
+            # real declared encoding.
             $charset = 'UTF-8'
-            $csMatch = [regex]::Match($raw, '(?i)<meta[^>]+charset\s*=\s*"?([\w\-]+)')
+            $headMatch = [regex]::Match($raw, '(?is)<head\b[^>]*>.*?</head>')
+            $headSection = if ($headMatch.Success) { $headMatch.Value } else { $raw }
+            $csMatch = [regex]::Match($headSection, '(?i)<meta[^>]+charset\s*=\s*"?([\w\-]+)')
             if ($csMatch.Success) { $charset = $csMatch.Groups[1].Value }
-            $enc = Get-EncodingByName -Name $charset
-            $htmlFragment = $enc.GetString($bytes)
+            $htmlFragment = Get-TextFromBytesSafe -Bytes $bytes -CharsetName $charset
         }
 
         return ConvertTo-PlainTextFromHtml -Html $htmlFragment
